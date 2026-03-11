@@ -36,12 +36,11 @@ def _read_csv_robust(fname: str) -> pd.DataFrame:
             try:
                 df = pd.read_csv(path, encoding=enc, sep=sep, low_memory=False)
                 if len(df.columns) > 1:
-                    return df
+                    return df.copy()  # .copy() evita fragmentación
             except Exception:
                 continue
-    # Último intento sin especificar
     try:
-        return pd.read_csv(path, encoding="latin-1", on_bad_lines="skip")
+        return pd.read_csv(path, encoding="latin-1", on_bad_lines="skip").copy()
     except Exception:
         return pd.DataFrame()
 
@@ -282,67 +281,107 @@ def load_youtube():
 @st.cache_data(ttl=3600)
 def load_instagram_posts():
     """
-    Post Instagram.csv — columnas exactas conocidas:
-    identificador de la publicación, Fecha, Visualizaciones, Alcance,
-    Me gusta, Veces que se ha compartido, Seguidores, Comentarios, Veces guardado,
-    Tipo de publicación, Enlace permanente
+    Post Instagram.csv
+    IMPORTANTE: 'Fecha' siempre es 'Total' (agrupador de Meta).
+    La fecha real del post está en 'Hora de publicación' (MM/DD/YYYY HH:MM).
+    Cada fila = 1 publicación.
+    Columnas: identificador de la publicación, Hora de publicación, Tipo de publicación,
+              Visualizaciones, Alcance, Me gusta, Comentarios, Veces que se ha compartido,
+              Veces guardado, Seguidores, Descripción, Enlace permanente
     """
     df = _read_csv_robust("Post Instagram.csv")
     if df.empty:
         return df
-    # Renombrar columna de ID si existe con nombre largo
+    # Renombrar ID
     for old in ["identificador de la publicación", "identificador"]:
         if old in df.columns:
-            df = df.rename(columns={old: "id_post"})
-            break
-    df = _to_dt(df, "Fecha")
+            df = df.rename(columns={old: "id_post"}); break
+    # La fecha real es 'Hora de publicación', parsear formato MM/DD/YYYY HH:MM
+    if "Hora de publicación" in df.columns:
+        df["fecha_post"] = pd.to_datetime(df["Hora de publicación"],
+                                          format="%m/%d/%Y %H:%M", errors="coerce")
+        # Fallback formato alternativo
+        mask_null = df["fecha_post"].isna()
+        if mask_null.any():
+            df.loc[mask_null, "fecha_post"] = pd.to_datetime(
+                df.loc[mask_null, "Hora de publicación"], errors="coerce")
+    else:
+        df["fecha_post"] = pd.NaT
+    # Limpiar filas sin fecha (filas de resumen/total sin fecha real)
+    df = df[df["fecha_post"].notna()].copy()
     df = _safe_numeric(df, "Visualizaciones", "Alcance", "Me gusta",
                        "Comentarios", "Veces que se ha compartido",
                        "Veces guardado", "Seguidores")
-    return df
+    return df.reset_index(drop=True)
+
 
 @st.cache_data(ttl=3600)
 def load_instagram_stories():
     """
-    Instagram Historys.csv — columnas:
-    identificador de la publicación, Fecha, Visualizaciones, Alcance,
-    Me gusta, Clics en el enlace, Respuestas, Navegación, Seguidores,
-    Tipo de publicación
+    Instagram Historys.csv
+    Misma estructura que Posts: 'Hora de publicación' es la fecha real.
+    Columnas: identificador de la publicación, Hora de publicación, Tipo de publicación,
+              Visualizaciones, Alcance, Me gusta, Clics en el enlace, Respuestas,
+              Navegación, Toques en stickers, Seguidores
     """
     df = _read_csv_robust("Instagram Historys.csv")
     if df.empty:
         return df
     for old in ["identificador de la publicación", "identificador"]:
         if old in df.columns:
-            df = df.rename(columns={old: "id_post"})
-            break
-    df = _to_dt(df, "Fecha")
+            df = df.rename(columns={old: "id_post"}); break
+    if "Hora de publicación" in df.columns:
+        df["fecha_post"] = pd.to_datetime(df["Hora de publicación"],
+                                          format="%m/%d/%Y %H:%M", errors="coerce")
+        mask_null = df["fecha_post"].isna()
+        if mask_null.any():
+            df.loc[mask_null, "fecha_post"] = pd.to_datetime(
+                df.loc[mask_null, "Hora de publicación"], errors="coerce")
+    else:
+        df["fecha_post"] = pd.NaT
+    df = df[df["fecha_post"].notna()].copy()
     df = _safe_numeric(df, "Visualizaciones", "Alcance", "Me gusta",
-                       "Clics en el enlace", "Respuestas", "Seguidores")
-    return df
+                       "Clics en el enlace", "Respuestas", "Seguidores",
+                       "Navegación", "Toques en stickers")
+    return df.reset_index(drop=True)
+
 
 @st.cache_data(ttl=3600)
 def load_facebook():
     """
-    Post Facebook.csv — columnas principales:
-    Fecha, Título, Alcance, Visualizaciones de vídeo de 3 segundos,
-    Reacciones, Comentarios, Veces que se ha compartido, Segundos reproducidos
+    Post Facebook.csv  (viene con BOM utf-8-sig)
+    IMPORTANTE: 'Fecha' siempre es 'Total'. La fecha real = 'Hora de publicación'.
+    Columnas clave: Título, Hora de publicación, Alcance,
+                    Visualizaciones de vídeo de 3 segundos,
+                    Visualizaciones de vídeo de 1 minuto,
+                    Reacciones, Comentarios, Veces que se ha compartido,
+                    Segundos reproducidos, Segundos reproducidos de media,
+                    Espectadores de 3 segundos, Ingresos estimados (USD)
     """
     df = _read_csv_robust("Post Facebook.csv")
     if df.empty:
         return df
-    # Normalizar columna de fecha — puede llamarse 'Fecha' o 'Hora de publicación'
-    if "Fecha" not in df.columns and "Hora de publicación" in df.columns:
-        df = df.rename(columns={"Hora de publicación": "Fecha"})
-    df = _to_dt(df, "Fecha")
-    num_cols = ["Alcance", "Visualizaciones de vídeo de 3 segundos",
-                "Visualizaciones de vídeo de 1 minuto",
-                "Reacciones, comentarios y veces que se ha compartido",
-                "Reacciones", "Comentarios", "Veces que se ha compartido",
-                "Segundos reproducidos", "Segundos reproducidos de media",
-                "Espectadores de 3 segundos"]
+    if "Hora de publicación" in df.columns:
+        df["fecha_post"] = pd.to_datetime(df["Hora de publicación"],
+                                          format="%m/%d/%Y %H:%M", errors="coerce")
+        mask_null = df["fecha_post"].isna()
+        if mask_null.any():
+            df.loc[mask_null, "fecha_post"] = pd.to_datetime(
+                df.loc[mask_null, "Hora de publicación"], errors="coerce")
+    else:
+        df["fecha_post"] = pd.NaT
+    df = df[df["fecha_post"].notna()].copy()
+    num_cols = [
+        "Alcance", "Visualizaciones de vídeo de 3 segundos",
+        "Visualizaciones de vídeo de 1 minuto",
+        "Reacciones, comentarios y veces que se ha compartido",
+        "Reacciones", "Comentarios", "Veces que se ha compartido",
+        "Segundos reproducidos", "Segundos reproducidos de media",
+        "Espectadores de 3 segundos", "Espectadores de 1 minuto",
+        "Ingresos estimados (USD)"
+    ]
     df = _safe_numeric(df, *[c for c in num_cols if c in df.columns])
-    return df
+    return df.reset_index(drop=True)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
