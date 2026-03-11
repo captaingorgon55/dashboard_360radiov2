@@ -5,7 +5,7 @@ import plotly.express as px
 import plotly.graph_objects as go
 from datetime import date, timedelta
 import sys, os
-sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
+sys.path.insert(0, os.getcwd())
 from data_loader import (
     load_ga4_general, load_ga4_city, load_ga4_country, load_ga4_channel,
     load_ga4_age, load_ga4_device, load_ga4_interests,
