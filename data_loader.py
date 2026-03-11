@@ -360,17 +360,26 @@ def load_youtube():
 # =============================================================================
 
 def _load_social_base(fname: str, num_cols: list,
-                      id_col: str = "identificador de la publicacion") -> pd.DataFrame:
+                      id_col: str = "identificador de la publicación") -> pd.DataFrame:
     df = _read_csv_robust(fname)
     if df.empty:
         return df
-    for old in [id_col, "identificador de la publicacion", "identificador"]:
-        if old in df.columns and old != "id_post":
-            df = df.rename(columns={old: "id_post"})
+    # buscar columna id con y sin tilde
+    for candidate in [id_col,
+                      "identificador de la publicación",
+                      "identificador de la publicacion",
+                      "Identificador de la pieza de vídeo",
+                      "Identificador de la pieza de video",
+                      "identificador"]:
+        if candidate in df.columns and candidate != "id_post":
+            df = df.rename(columns={candidate: "id_post"})
             break
-    hora_col = "Hora de publicacion"
-    if hora_col in df.columns:
-        df["fecha_post"] = _parse_fecha(df[hora_col])
+    # buscar columna hora con y sin tilde
+    for hora_col in ["Hora de publicación", "Hora de publicacion"]:
+        if hora_col in df.columns:
+            # forzar a str para que _parse_fecha funcione con StringDtype
+            df["fecha_post"] = _parse_fecha(df[hora_col].astype(str).replace("nan", pd.NA))
+            break
     else:
         df["fecha_post"] = pd.NaT
     df = df[df["fecha_post"].notna()].copy()
@@ -384,9 +393,13 @@ def load_instagram_posts() -> pd.DataFrame:
         "Post Instagram.csv",
         ["Visualizaciones", "Alcance", "Me gusta", "Comentarios",
          "Veces que se ha compartido", "Veces guardado", "Seguidores"],
+        id_col="identificador de la publicación",
     )
-    if not df.empty and "Tipo de publicacion" in df.columns:
-        df = df[df["Tipo de publicacion"].str.strip() != "Historia de Instagram"].copy()
+    if not df.empty:
+        for tipo_col in ["Tipo de publicación", "Tipo de publicacion"]:
+            if tipo_col in df.columns:
+                df = df[df[tipo_col].str.strip() != "Historia de Instagram"].copy()
+                break
     return df.reset_index(drop=True)
 
 
@@ -395,8 +408,9 @@ def load_instagram_stories() -> pd.DataFrame:
     return _load_social_base(
         "Instagram Historys.csv",
         ["Visualizaciones", "Alcance", "Me gusta", "Clics en el enlace",
-         "Respuestas", "Seguidores", "Navegacion", "Toques en stickers",
-         "Visitas al perfil"],
+         "Respuestas", "Seguidores", "Navegación", "Navegacion",
+         "Toques en stickers", "Visitas al perfil"],
+        id_col="identificador de la publicación",
     )
 
 
@@ -404,16 +418,17 @@ def load_instagram_stories() -> pd.DataFrame:
 def load_facebook() -> pd.DataFrame:
     df = _load_social_base(
         "Post Facebook.csv",
-        ["Alcance", "Visualizaciones de video de 3 segundos",
+        ["Alcance",
+         "Visualizaciones de vídeo de 3 segundos",
+         "Visualizaciones de vídeo de 1 minuto",
+         "Visualizaciones de video de 3 segundos",
          "Visualizaciones de video de 1 minuto",
          "Reacciones, comentarios y veces que se ha compartido",
          "Reacciones", "Comentarios", "Veces que se ha compartido",
          "Segundos reproducidos", "Segundos reproducidos de media",
          "Espectadores de 3 segundos", "Espectadores de 1 minuto"],
-        id_col="Identificador de la pieza de video",
+        id_col="Identificador de la pieza de vídeo",
     )
-    if not df.empty and "Identificador de la pieza de video" in df.columns:
-        df = df.rename(columns={"Identificador de la pieza de video": "id_post"})
     return df.reset_index(drop=True)
 
 
