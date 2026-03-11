@@ -35,21 +35,18 @@ mgid    = load_mgid()
 gam     = load_admanager()
 yt      = load_youtube()
 
-# yt["grafico"] tiene DATE diaria + métricas → se puede filtrar por fecha
-# yt["tabla"]   tiene datos por video (sin fecha diaria) → NO filtrable por fecha
-# yt["totales"] tiene totales del período exportado desde YT Studio → NO filtrable
-yt_gr_raw = yt.get("grafico",  pd.DataFrame())  # DATE, Visualizaciones, Ingresos...
-yt_tb_raw = yt.get("tabla",    pd.DataFrame())  # por video, sin fecha diaria
-yt_tot    = yt.get("totales",  pd.DataFrame())  # totales globales
+yt_gr_raw = yt.get("grafico", pd.DataFrame())
+yt_tb_raw = yt.get("tabla",   pd.DataFrame())
+yt_tot    = yt.get("totales", pd.DataFrame())
 
-# Detectar columna de fecha en yt_gr_raw (puede ser "Fecha" o "DATE")
-yt_date_col = None
-for c in ["Fecha", "DATE", "Date"]:
-    if not yt_gr_raw.empty and c in yt_gr_raw.columns:
-        yt_date_col = c
-        break
+# ✅ Detectar columnas sobre yt_gr_raw (ANTES de cualquier filtro)
+yt_date_col = next((c for c in ["Fecha","DATE","Date"] if not yt_gr_raw.empty and c in yt_gr_raw.columns), None)
+yt_rev_col  = next((c for c in ["Ingresos estimados (USD)","Revenue (USD)","Estimated revenue (USD)","Ingresos estimados","Ingresos"]
+                    if not yt_gr_raw.empty and c in yt_gr_raw.columns), None)
+yt_views_col = next((c for c in ["Visualizaciones","Views","Vistas"]
+                     if not yt_gr_raw.empty and c in yt_gr_raw.columns), None)
 
-# Construir rango de fechas global
+# ── Rango de fechas global ────────────────────────────────────────────────────
 all_dates = []
 for df, col in [(adsense,"Date"),(mgid,"Date"),(gam["diario"],"DATE")]:
     if not df.empty and col in df.columns:
@@ -73,81 +70,61 @@ with fc3:
 st.markdown('</div>', unsafe_allow_html=True)
 
 # ── Filtrar por fecha ─────────────────────────────────────────────────────────
-as_f  = filter_by_date(adsense,       "Date", start, end) if "AdSense"    in plataformas else pd.DataFrame()
-mg_f  = filter_by_date(mgid,          "Date", start, end) if "MGID"       in plataformas else pd.DataFrame()
-gd_f  = filter_by_date(gam["diario"], "DATE", start, end) if "Ad Manager" in plataformas else pd.DataFrame()
+as_f = filter_by_date(adsense,       "Date", start, end) if "AdSense"    in plataformas else pd.DataFrame()
+mg_f = filter_by_date(mgid,          "Date", start, end) if "MGID"       in plataformas else pd.DataFrame()
+gd_f = filter_by_date(gam["diario"], "DATE", start, end) if "Ad Manager" in plataformas else pd.DataFrame()
 
-# ✅ YouTube: filtrar yt_gr por fecha para métricas y gráficos
+# ✅ YouTube: filtrar usando yt_date_col detectado sobre raw
 yt_gr = pd.DataFrame()
 if "YouTube" in plataformas and yt_date_col and not yt_gr_raw.empty:
     yt_gr = filter_by_date(yt_gr_raw, yt_date_col, start, end)
 
-# Períodos anteriores para deltas
-pd_   = (end - start).days or 1
+# Períodos anteriores
+pd_    = (end - start).days or 1
 ps, pe = start - timedelta(days=pd_), start - timedelta(days=1)
-as_p  = filter_by_date(adsense,       "Date", ps, pe)
-mg_p  = filter_by_date(mgid,          "Date", ps, pe)
-gd_p  = filter_by_date(gam["diario"], "DATE", ps, pe)
+as_p   = filter_by_date(adsense,       "Date", ps, pe)
+mg_p   = filter_by_date(mgid,          "Date", ps, pe)
+gd_p   = filter_by_date(gam["diario"], "DATE", ps, pe)
 yt_gr_p = filter_by_date(yt_gr_raw, yt_date_col, ps, pe) if yt_date_col and not yt_gr_raw.empty else pd.DataFrame()
-
-# ── Detectar columna de revenue en yt_gr ─────────────────────────────────────
-# YT Studio exporta revenue como "Ingresos estimados (USD)" o "Revenue (USD)"
-yt_rev_col = None
-for c in ["Ingresos estimados (USD)", "Revenue (USD)", "Estimated revenue (USD)", "Ingresos"]:
-    if not yt_gr.empty and c in yt_gr.columns:
-        yt_rev_col = c
-        break
-
-yt_views_col = None
-for c in ["Visualizaciones", "Views", "Vistas"]:
-    if not yt_gr.empty and c in yt_gr.columns:
-        yt_views_col = c
-        break
 
 # ── Calcular métricas ─────────────────────────────────────────────────────────
 rev_as  = _s(as_f, "Estimated earnings (USD)")
 rev_mg  = _s(mg_f, "Revenue")
 rev_gam = _s(gd_f, "AD_SERVER_CPM_AND_CPC_REVENUE")
-
-# ✅ Revenue YouTube desde yt_gr filtrado (tiene fecha), no desde yt_tb
-rev_yt  = _s(yt_gr, yt_rev_col) if yt_rev_col else 0
-rev_yt_p = _s(yt_gr_p, yt_rev_col) if yt_rev_col and not yt_gr_p.empty else 0
+rev_yt  = _s(yt_gr,   yt_rev_col)  if yt_rev_col else 0
+rev_yt_p = _s(yt_gr_p, yt_rev_col) if yt_rev_col else 0
 
 rev_tot   = rev_as + rev_mg + rev_gam + rev_yt
-rev_tot_p = _s(as_p,"Estimated earnings (USD)") + _s(mg_p,"Revenue") + _s(gd_p,"AD_SERVER_CPM_AND_CPC_REVENUE") + rev_yt_p
+rev_tot_p = (_s(as_p,"Estimated earnings (USD)") + _s(mg_p,"Revenue")
+             + _s(gd_p,"AD_SERVER_CPM_AND_CPC_REVENUE") + rev_yt_p)
 
-# Impresiones
 impr_as  = int(_s(as_f, "Impressions"))
 impr_mg  = int(_s(mg_f, "Page views"))
 impr_gam = int(_s(gd_f, "AD_SERVER_IMPRESSIONS"))
-# ✅ Views YouTube desde yt_gr filtrado
 impr_yt  = int(_s(yt_gr, yt_views_col)) if yt_views_col else 0
 tot_impr   = impr_as + impr_mg + impr_gam
 tot_impr_p = int(_s(as_p,"Impressions")) + int(_s(gd_p,"AD_SERVER_IMPRESSIONS"))
 
-# Clicks
 cl_as  = int(_s(as_f, "Clicks"))
 cl_mg  = int(_s(mg_f, "Ad Clicks"))
 cl_gam = int(_s(gd_f, "AD_SERVER_CLICKS"))
 tot_cl   = cl_as + cl_mg + cl_gam
 tot_cl_p = int(_s(as_p,"Clicks")) + int(_s(gd_p,"AD_SERVER_CLICKS"))
 
-# CPM promedio ponderado
 cpms = []
 if not as_f.empty  and "Impression RPM (USD)"               in as_f.columns  and impr_as  > 0: cpms.append((_s(as_f,  "Impression RPM (USD)"),               impr_as))
 if not gd_f.empty  and "AD_SERVER_WITHOUT_CPD_AVERAGE_ECPM" in gd_f.columns  and impr_gam > 0: cpms.append((_s(gd_f,  "AD_SERVER_WITHOUT_CPD_AVERAGE_ECPM"), impr_gam))
 if not mg_f.empty  and "Ad RPM"                             in mg_f.columns  and impr_mg  > 0: cpms.append((_s(mg_f,  "Ad RPM"),                             impr_mg))
 cpm_avg = sum(v/max(w,1)*w for v,w in cpms) / max(sum(w for _,w in cpms), 1) if cpms else 0
-
 ctr_gam = gd_f["AD_SERVER_CTR"].mean()*100 if not gd_f.empty and "AD_SERVER_CTR" in gd_f.columns else 0
 
 # ── MÉTRICAS ──────────────────────────────────────────────────────────────────
 sh("📊 Métricas Generales")
 m1,m2,m3,m4,m5 = st.columns(5)
-m1.metric("💵 Revenue Total",   f"${rev_tot:,.2f}",   _delta(rev_tot,   rev_tot_p))
+m1.metric("💵 Revenue Total",   f"${rev_tot:,.2f}",   _delta(rev_tot,  rev_tot_p))
 m2.metric("📈 CPM Promedio",    f"${cpm_avg:.2f}")
-m3.metric("👁 Impresiones Ads", fmt_number(tot_impr), _delta(tot_impr,  tot_impr_p))
-m4.metric("🖱️ Clicks Totales",  fmt_number(tot_cl),   _delta(tot_cl,    tot_cl_p))
+m3.metric("👁 Impresiones Ads", fmt_number(tot_impr), _delta(tot_impr, tot_impr_p))
+m4.metric("🖱️ Clicks Totales",  fmt_number(tot_cl),   _delta(tot_cl,   tot_cl_p))
 m5.metric("📊 CTR Ad Manager",  f"{ctr_gam:.2f}%")
 
 # ── TABLA RESUMEN ─────────────────────────────────────────────────────────────
@@ -156,7 +133,8 @@ rows = []
 if "AdSense"    in plataformas and not as_f.empty:  rows.append({"Plataforma":"AdSense",    "Revenue":rev_as,  "Impresiones":impr_as,  "Clicks":cl_as,  "CPM":_s(as_f,"Impression RPM (USD)")})
 if "MGID"       in plataformas and not mg_f.empty:  rows.append({"Plataforma":"MGID",       "Revenue":rev_mg,  "Impresiones":impr_mg,  "Clicks":cl_mg,  "CPM":_s(mg_f,"Ad RPM")})
 if "Ad Manager" in plataformas and not gd_f.empty:  rows.append({"Plataforma":"Ad Manager", "Revenue":rev_gam, "Impresiones":impr_gam, "Clicks":cl_gam, "CPM":_s(gd_f,"AD_SERVER_WITHOUT_CPD_AVERAGE_ECPM")})
-if "YouTube"    in plataformas and not yt_gr.empty: rows.append({"Plataforma":"YouTube",    "Revenue":rev_yt,  "Impresiones":impr_yt,  "Clicks":0,      "CPM":0})
+if "YouTube"    in plataformas and not yt_gr_raw.empty:
+    rows.append({"Plataforma":"YouTube", "Revenue":rev_yt, "Impresiones":impr_yt, "Clicks":0, "CPM":0})
 if rows:
     r_df = pd.DataFrame(rows)
     st.dataframe(r_df.style.format({"Revenue":"${:,.2f}","Impresiones":"{:,.0f}","Clicks":"{:,.0f}","CPM":"${:,.3f}"}),
@@ -183,9 +161,9 @@ if rows:
 sh("📈 Evolución Mensual · Revenue Combinado")
 frames = []
 for df_, dcol, plat, col_rev in [
-    (as_f,  "Date",  "AdSense",    "Estimated earnings (USD)"),
-    (mg_f,  "Date",  "MGID",       "Revenue"),
-    (gd_f,  "DATE",  "Ad Manager", "AD_SERVER_CPM_AND_CPC_REVENUE"),
+    (as_f, "Date",  "AdSense",    "Estimated earnings (USD)"),
+    (mg_f, "Date",  "MGID",       "Revenue"),
+    (gd_f, "DATE",  "Ad Manager", "AD_SERVER_CPM_AND_CPC_REVENUE"),
 ]:
     if not df_.empty and dcol in df_.columns and col_rev in df_.columns:
         t = df_.copy(); t["mes"] = t[dcol].dt.to_period("M").astype(str)
@@ -193,7 +171,7 @@ for df_, dcol, plat, col_rev in [
         tmp.columns = ["mes","Revenue"]; tmp["Plataforma"] = plat
         frames.append(tmp)
 
-# ✅ YouTube en evolución mensual usando yt_gr filtrado
+# ✅ YouTube en evolución usando yt_gr filtrado + cols detectadas sobre raw
 if "YouTube" in plataformas and not yt_gr.empty and yt_date_col and yt_rev_col:
     t = yt_gr.copy()
     t["mes"] = pd.to_datetime(t[yt_date_col], errors="coerce").dt.to_period("M").astype(str)
@@ -285,31 +263,35 @@ if "MGID" in plataformas and not mg_f.empty:
     if "vRPM"    in mg_s.columns: nf2["vRPM"]    = "${:,.3f}"
     st.dataframe(mg_s.style.format(nf2), use_container_width=True, hide_index=True, height=300)
 
-# ── G7: YouTube · Evolución mensual ──────────────────────────────────────────
-# ✅ Sección dedicada de YouTube usando yt_gr filtrado
-if "YouTube" in plataformas and not yt_gr.empty and yt_date_col:
+# ── G7: YouTube · Evolución mensual ───────────────────────────────────────────
+if "YouTube" in plataformas and not yt_gr_raw.empty and yt_date_col:
     sh("▶️ YouTube · Evolución Mensual")
-    ytc = yt_gr.copy()
-    ytc["mes"] = pd.to_datetime(ytc[yt_date_col], errors="coerce").dt.to_period("M").astype(str)
-    ag_yt = {}
-    if yt_views_col: ag_yt[yt_views_col] = "sum"
-    if yt_rev_col:   ag_yt[yt_rev_col]   = "sum"
-    if ag_yt:
-        yt_m = ytc.groupby("mes").agg(ag_yt).reset_index()
-        fyt  = go.Figure()
-        if yt_views_col and yt_views_col in yt_m.columns:
-            fyt.add_trace(go.Bar(x=yt_m["mes"], y=yt_m[yt_views_col],
-                name="Visualizaciones", marker_color=C[4], opacity=0.7))
-        if yt_rev_col and yt_rev_col in yt_m.columns:
-            fyt.add_trace(go.Scatter(x=yt_m["mes"], y=yt_m[yt_rev_col],
-                name="Revenue", mode="lines+markers",
-                line=dict(color=C[3],width=2.5), yaxis="y2", marker=dict(size=7)))
-        fyt.update_layout(
-            barmode="overlay",
-            yaxis2=dict(overlaying="y", side="right", showgrid=False,
-                        tickprefix="$", tickfont=dict(color=C[3])),
-            legend=dict(orientation="h", y=1.12))
-        _fig(fyt,300); st.plotly_chart(fyt,use_container_width=True)
+    # ✅ Usar yt_gr si tiene datos; si no, caer al raw completo con aviso
+    src_yt = yt_gr if not yt_gr.empty else pd.DataFrame()
+    if src_yt.empty:
+        st.info("Sin datos de YouTube para el período seleccionado.")
+    else:
+        ytc = src_yt.copy()
+        ytc["mes"] = pd.to_datetime(ytc[yt_date_col], errors="coerce").dt.to_period("M").astype(str)
+        ag_yt = {}
+        if yt_views_col and yt_views_col in ytc.columns: ag_yt[yt_views_col] = "sum"
+        if yt_rev_col   and yt_rev_col   in ytc.columns: ag_yt[yt_rev_col]   = "sum"
+        if ag_yt:
+            yt_m = ytc.groupby("mes").agg(ag_yt).reset_index()
+            fyt  = go.Figure()
+            if yt_views_col and yt_views_col in yt_m.columns:
+                fyt.add_trace(go.Bar(x=yt_m["mes"], y=yt_m[yt_views_col],
+                    name="Visualizaciones", marker_color=C[4], opacity=0.7))
+            if yt_rev_col and yt_rev_col in yt_m.columns:
+                fyt.add_trace(go.Scatter(x=yt_m["mes"], y=yt_m[yt_rev_col],
+                    name="Revenue", mode="lines+markers",
+                    line=dict(color=C[3],width=2.5), yaxis="y2", marker=dict(size=7)))
+            fyt.update_layout(
+                barmode="overlay",
+                yaxis2=dict(overlaying="y", side="right", showgrid=False,
+                            tickprefix="$", tickfont=dict(color=C[3])),
+                legend=dict(orientation="h", y=1.12))
+            _fig(fyt,300); st.plotly_chart(fyt,use_container_width=True)
 
 # ── G8: Dispositivos Ad Manager ───────────────────────────────────────────────
 if "Ad Manager" in plataformas:
