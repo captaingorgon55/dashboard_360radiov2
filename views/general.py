@@ -31,18 +31,17 @@ st.markdown('<div class="page-title">🏠 General · Tráfico y Producción</div
 st.markdown('<div class="page-subtitle">GA4 · Producción editorial</div>', unsafe_allow_html=True)
 
 # ════════════════════════════════════════════════════════════════════════════
-# CARGA — solo lo necesario para esta página, todo cacheado
-# No se carga search_console aquí (se usa solo en su pestaña)
+# CARGA
 # ════════════════════════════════════════════════════════════════════════════
 with st.spinner("Cargando datos..."):
-    ga4_r  = load_ga4_general()   # date, activeUsers, sessions, screenPageViews, userEngagementDuration
-    city_r = load_ga4_city()      # date, city, activeUsers, sessions, screenPageViews
-    cnt_r  = load_ga4_country()   # date, country, activeUsers
-    chan_r  = load_ga4_channel()   # date, sessionDefaultChannelGroup, activeUsers, sessions, screenPageViews
-    age_r  = load_ga4_age()       # date, userAgeBracket, activeUsers
-    dev_r  = load_ga4_device()    # date, deviceCategory, activeUsers, screenPageViews
-    urls_r = load_ga4_urls()      # date, pagePath, pageTitle, screenPageViews, activeUsers
-    prod_r = load_produccion_con_metricas()  # enriquecida con ga4_views, ga4_users, match_method
+    ga4_r  = load_ga4_general()
+    city_r = load_ga4_city()
+    cnt_r  = load_ga4_country()
+    chan_r  = load_ga4_channel()
+    age_r  = load_ga4_age()
+    dev_r  = load_ga4_device()
+    urls_r = load_ga4_urls()
+    prod_r = load_produccion_con_metricas()
 
 min_d, max_d = get_date_range(ga4_r, "date")
 
@@ -82,47 +81,103 @@ with c6: sel_chan = st.selectbox("📡 Canal", chan_list, key="gch")
 st.markdown('</div>', unsafe_allow_html=True)
 
 # ════════════════════════════════════════════════════════════════════════════
-# FILTRAR POR FECHA TODAS LAS HOJAS
+# FILTRAR POR FECHA
 # ════════════════════════════════════════════════════════════════════════════
-ga4  = filter_by_date(ga4_r,  "date", start, end)   # totales diarios — sin dimensión
-city = filter_by_date(city_r, "date", start, end)   # por ciudad
-cnt  = filter_by_date(cnt_r,  "date", start, end)   # por país
-chan = filter_by_date(chan_r,  "date", start, end)   # por canal
-age  = filter_by_date(age_r,  "date", start, end)   # por edad
-dev  = filter_by_date(dev_r,  "date", start, end)   # por dispositivo
-urls = filter_by_date(urls_r, "date", start, end)   # por URL
-
-# ════════════════════════════════════════════════════════════════════════════
-# LÓGICA DE FUENTE PARA MÉTRICAS
-# ════════════════════════════════════════════════════════════════════════════
-# GA4 NO tiene una hoja con todas las dimensiones juntas.
-# Cada hoja tiene su propia dimensión:
-#   ga4_r  → totales globales diarios (sin city, sin canal)
-#   city_r → tiene city + activeUsers/sessions/screenPageViews
-#   chan_r → tiene sessionDefaultChannelGroup + activeUsers/sessions/screenPageViews
-#
-# REGLA:
-#   Sin filtros de dimensión → _src = ga4 (datos globales más precisos)
-#   Con ciudad               → _src = city filtrada  (tiene las métricas de esa ciudad)
-#   Con canal                → _src = chan filtrada  (tiene las métricas de ese canal)
-#   Ambos                    → intersección de fechas ciudad ∩ canal
-# ════════════════════════════════════════════════════════════════════════════
-has_city = sel_city != "Todas" and not city.empty and "city" in city.columns
-has_chan = sel_chan  != "Todos" and not chan.empty  and "sessionDefaultChannelGroup" in chan.columns
-
-if has_city: city = city[city["city"] == sel_city]
-if has_chan: chan  = chan[chan["sessionDefaultChannelGroup"] == sel_chan]
+ga4  = filter_by_date(ga4_r,  "date", start, end)
+city = filter_by_date(city_r, "date", start, end)
+cnt  = filter_by_date(cnt_r,  "date", start, end)
+chan = filter_by_date(chan_r,  "date", start, end)
+age  = filter_by_date(age_r,  "date", start, end)
+dev  = filter_by_date(dev_r,  "date", start, end)
+urls = filter_by_date(urls_r, "date", start, end)
 
 pd_ = max((end-start).days, 1)
 prev_s, prev_e = start - timedelta(days=pd_), start - timedelta(days=1)
 
-if has_city and has_chan:
+# ════════════════════════════════════════════════════════════════════════════
+# FILTRAR PRODUCCIÓN (fecha + autor + categoría)
+# ════════════════════════════════════════════════════════════════════════════
+prod = filter_by_date(prod_r, "post_date", start, end)
+if sel_aut != "Todos" and "post_author_name" in prod.columns:
+    prod = prod[prod["post_author_name"] == sel_aut]
+if sel_cat != "Todas" and "categories" in prod.columns:
+    prod = prod[prod["categories"].fillna("").apply(
+        lambda x: sel_cat in [p.strip() for p in str(x).split(",")])]
+
+# ════════════════════════════════════════════════════════════════════════════
+# FILTRO DE AUTOR → construir _src desde URLs del autor cruzadas con GA4
+# Cuando hay filtro de autor, las métricas de usuarios/vistas se calculan
+# sumando solo las URLs que pertenecen a notas de ese autor.
+# ════════════════════════════════════════════════════════════════════════════
+has_city = sel_city != "Todas" and not city.empty and "city" in city.columns
+has_chan = sel_chan  != "Todos" and not chan.empty  and "sessionDefaultChannelGroup" in chan.columns
+has_aut  = sel_aut  != "Todos"
+
+if has_city: city = city[city["city"] == sel_city]
+if has_chan: chan  = chan[chan["sessionDefaultChannelGroup"] == sel_chan]
+
+# Paths de las notas del autor filtrado (para cruzar con GA4 urls)
+def _author_paths(prod_df):
+    """Retorna set de pagePaths normalizados de las notas del autor."""
+    if prod_df.empty or "url" not in prod_df.columns:
+        return set()
+    return {_up(str(u)).path.rstrip("/") for u in prod_df["url"] if pd.notna(u)}
+
+# URLs filtradas por autor y/o categoría
+if (has_aut or sel_cat != "Todas") and not prod.empty and not urls.empty and "pagePath" in urls.columns:
+    valid_paths = _author_paths(prod)
+    urls = urls[urls["pagePath"].apply(lambda p: str(p).rstrip("/")).isin(valid_paths)]
+elif sel_cat != "Todas" and not prod.empty and not urls.empty and "pagePath" in urls.columns:
+    valid_paths = _author_paths(prod)
+    urls = urls[urls["pagePath"].apply(lambda p: str(p).rstrip("/")).isin(valid_paths)]
+
+# ════════════════════════════════════════════════════════════════════════════
+# _src: fuente de métricas según filtros activos
+#
+# Prioridad:
+#   1. Autor activo  → métricas calculadas desde urls del autor (GA4 urls)
+#   2. Ciudad activa → city df
+#   3. Canal activo  → chan df
+#   4. Sin filtro    → ga4 global
+#
+# Si hay autor + ciudad/canal se combinan (autor reduce URLs, ciudad/canal
+# reducen la hoja de dimensión correspondiente — son ortogonales).
+# ════════════════════════════════════════════════════════════════════════════
+
+def _urls_to_daily(urls_df):
+    """
+    Agrega urls_df (que tiene date + screenPageViews + activeUsers por URL)
+    a nivel diario → equivalente a ga4 diario pero solo para las URLs del autor.
+    """
+    if urls_df.empty or "date" not in urls_df.columns:
+        return pd.DataFrame()
+    cols = [c for c in ["date","screenPageViews","activeUsers","sessions"] if c in urls_df.columns]
+    agg = {c: (c,"sum") for c in cols if c != "date"}
+    return urls_df[cols].groupby("date", as_index=False).agg(**agg)
+
+if has_aut:
+    # Fuente de métricas: sum de las URLs del autor por día
+    _src = _urls_to_daily(urls)
+    # Período previo: calcular igual desde urls_r filtrado por autor + fechas previas
+    urls_prev = filter_by_date(urls_r, "date", prev_s, prev_e)
+    prod_prev = filter_by_date(prod_r, "post_date", start, end)  # prod total para paths
+    if sel_aut != "Todos" and "post_author_name" in prod_prev.columns:
+        prod_prev = prod_prev  # ya filtramos prod más abajo — usamos prod_r completo
+    # paths del autor en toda la historia (para prev)
+    prod_all_aut = prod_r[prod_r["post_author_name"] == sel_aut] if "post_author_name" in prod_r.columns else pd.DataFrame()
+    valid_all = _author_paths(prod_all_aut)
+    if not urls_prev.empty and valid_all and "pagePath" in urls_prev.columns:
+        urls_prev = urls_prev[urls_prev["pagePath"].apply(lambda p: str(p).rstrip("/")).isin(valid_all)]
+    _src_p = _urls_to_daily(urls_prev)
+    # Renombrar para que safe_sum encuentre activeUsers / screenPageViews
+    st.caption(f"✍️ Filtrando por autor: **{sel_aut}**")
+
+elif has_city and has_chan:
     d1 = set(city["date"].dt.date) if "date" in city.columns else set()
-    d2 = set(chan["date"].dt.date)  if "date" in chan.columns  else set()
+    d2 = set(chan["date"].dt.date) if "date" in chan.columns else set()
     common = d1 & d2
     _src   = city[city["date"].dt.date.isin(common)] if common else city
-    # Período previo
-    cp = filter_by_date(city_r,"date",prev_s,prev_e)
+    cp     = filter_by_date(city_r,"date",prev_s,prev_e)
     _src_p = cp[cp["city"]==sel_city] if not cp.empty and "city" in cp.columns else pd.DataFrame()
     st.caption(f"🏙️ **{sel_city}**  ·  📡 **{sel_chan}**")
 
@@ -142,21 +197,8 @@ else:
     _src   = ga4
     _src_p = filter_by_date(ga4_r,"date",prev_s,prev_e)
 
-# Filtrar producción (fecha + autor + categoría)
-prod = filter_by_date(prod_r, "post_date", start, end)
-if sel_aut != "Todos" and "post_author_name" in prod.columns:
-    prod = prod[prod["post_author_name"] == sel_aut]
-if sel_cat != "Todas" and "categories" in prod.columns:
-    prod = prod[prod["categories"].fillna("").apply(
-        lambda x: sel_cat in [p.strip() for p in str(x).split(",")])]
-
-# Si hay filtro de categoría → filtrar URLs también
-if sel_cat != "Todas" and not prod.empty and "url" in prod.columns and not urls.empty and "pagePath" in urls.columns:
-    valid = set(prod["url"].dropna().apply(lambda u: _up(str(u)).path.rstrip("/")))
-    urls = urls[urls["pagePath"].apply(lambda p: str(p).rstrip("/")).isin(valid)]
-
 # ════════════════════════════════════════════════════════════════════════════
-# MÉTRICAS — usan _src (refleja el filtro activo)
+# MÉTRICAS
 # ════════════════════════════════════════════════════════════════════════════
 sh("📊 Métricas del Período")
 m1,m2,m3,m4,m5,m6 = st.columns(6)
@@ -165,6 +207,7 @@ au   = int(safe_sum(_src,"activeUsers"));      au_p  = int(safe_sum(_src_p,"acti
 vw   = int(safe_sum(_src,"screenPageViews"));  vw_p  = int(safe_sum(_src_p,"screenPageViews"))
 ss   = int(safe_sum(_src,"sessions"));         ss_p  = int(safe_sum(_src_p,"sessions"))
 dur  = float(_src["userEngagementDuration"].mean()) if not _src.empty and "userEngagementDuration" in _src.columns else 0
+# URLs con tráfico: si hay filtro de autor usamos las urls ya filtradas
 u_ct = urls["pagePath"].nunique() if not urls.empty and "pagePath" in urls.columns else 0
 p_ct = len(prod) if not prod.empty else 0
 
@@ -176,7 +219,7 @@ m5.metric("🔗 URLs c/Tráfico", fmt_number(u_ct))
 m6.metric("✍️ Publicaciones",  fmt_number(p_ct))
 
 # ════════════════════════════════════════════════════════════════════════════
-# META Q1 — siempre desde ga4_r global (meta global del sitio)
+# META Q1
 # ════════════════════════════════════════════════════════════════════════════
 sh("🎯 Meta Q1 — 750,000 Usuarios")
 ga4_q = filter_by_date(ga4_r,"date",date(end.year,1,1),date(end.year,3,31))
@@ -189,7 +232,6 @@ with qc: st.metric("Faltan",fmt_number(max(750_000-q1u,0)),
             delta="✅ Meta!" if q1u>=750_000 else f"-{fmt_number(max(750_000-q1u,0))}",
             delta_color="normal" if q1u>=750_000 else "inverse")
 
-# Diagnóstico matching
 with st.expander("🔬 Diagnóstico matching Producción↔GA4", expanded=False):
     stats = match_stats(prod_r)
     if stats:
@@ -231,34 +273,40 @@ else:
     st.info("Sin datos GA4 para el período y filtros seleccionados.")
 
 # ════════════════════════════════════════════════════════════════════════════
-# G2: Canales — usa chan (ya filtrado si hay sel_chan)
+# G2: Canales
+# — si hay filtro de autor: recalcula desde urls del autor cruzando con chan_r
 # ════════════════════════════════════════════════════════════════════════════
 sh("📡 Canales de Tráfico")
-_chan_src = chan if not chan.empty else filter_by_date(chan_r,"date",start,end)
-if not _chan_src.empty and "sessionDefaultChannelGroup" in _chan_src.columns:
-    ca = (_chan_src.groupby("sessionDefaultChannelGroup",as_index=False)
-        .agg(U=("activeUsers","sum"),V=("screenPageViews","sum"),S=("sessions","sum"))
-        .sort_values("U",ascending=False))
-    cc1,cc2 = st.columns([1,2])
-    with cc1:
-        f2=px.pie(ca,names="sessionDefaultChannelGroup",values="U",
-            color_discrete_sequence=C,hole=0.52)
-        f2.update_traces(textposition="inside",textinfo="percent+label",textfont_size=11)
-        f2.update_layout(showlegend=False); _fig(f2,280); st.plotly_chart(f2,use_container_width=True)
-    with cc2:
-        st.dataframe(ca.rename(columns={"sessionDefaultChannelGroup":"Canal",
-            "U":"Usuarios","V":"Vistas","S":"Sesiones"})
-            .style.format({"Usuarios":"{:,.0f}","Vistas":"{:,.0f}","Sesiones":"{:,.0f}"}),
-            use_container_width=True,hide_index=True,height=260)
+if has_aut:
+    st.info("ℹ️ Desglose por canal no disponible con filtro de autor (GA4 no exporta canal por URL).")
 else:
-    st.info("Sin datos de canales.")
+    _chan_src = chan if not chan.empty else filter_by_date(chan_r,"date",start,end)
+    if not _chan_src.empty and "sessionDefaultChannelGroup" in _chan_src.columns:
+        ca = (_chan_src.groupby("sessionDefaultChannelGroup",as_index=False)
+            .agg(U=("activeUsers","sum"),V=("screenPageViews","sum"),S=("sessions","sum"))
+            .sort_values("U",ascending=False))
+        cc1,cc2 = st.columns([1,2])
+        with cc1:
+            f2=px.pie(ca,names="sessionDefaultChannelGroup",values="U",
+                color_discrete_sequence=C,hole=0.52)
+            f2.update_traces(textposition="inside",textinfo="percent+label",textfont_size=11)
+            f2.update_layout(showlegend=False); _fig(f2,280); st.plotly_chart(f2,use_container_width=True)
+        with cc2:
+            st.dataframe(ca.rename(columns={"sessionDefaultChannelGroup":"Canal",
+                "U":"Usuarios","V":"Vistas","S":"Sesiones"})
+                .style.format({"Usuarios":"{:,.0f}","Vistas":"{:,.0f}","Sesiones":"{:,.0f}"}),
+                use_container_width=True,hide_index=True,height=260)
+    else:
+        st.info("Sin datos de canales.")
 
 # ════════════════════════════════════════════════════════════════════════════
-# G3: Ciudades — usa city (ya filtrada si hay sel_city)
+# G3: Ciudades
 # ════════════════════════════════════════════════════════════════════════════
 sh("🏙️ Tráfico por Ciudad — Top 20")
 _city_src = city if not city.empty else filter_by_date(city_r,"date",start,end)
-if not _city_src.empty and "city" in _city_src.columns:
+if has_aut:
+    st.info("ℹ️ Desglose por ciudad no disponible con filtro de autor.")
+elif not _city_src.empty and "city" in _city_src.columns:
     cv = (_city_src[_city_src["city"]!="(not set)"]
         .groupby("city",as_index=False).agg(U=("activeUsers","sum"))
         .sort_values("U",ascending=False).head(20))
@@ -272,10 +320,12 @@ else:
     st.info("Sin datos de ciudades.")
 
 # ════════════════════════════════════════════════════════════════════════════
-# G4: Países — usa cnt (solo filtrado por fecha)
+# G4: Países
 # ════════════════════════════════════════════════════════════════════════════
 sh("🌎 Tráfico por País")
-if not cnt.empty and "country" in cnt.columns:
+if has_aut:
+    st.info("ℹ️ Desglose por país no disponible con filtro de autor.")
+elif not cnt.empty and "country" in cnt.columns:
     cv2 = (cnt[cnt["country"]!="(not set)"]
         .groupby("country",as_index=False).agg(U=("activeUsers","sum"))
         .sort_values("U",ascending=False))
@@ -294,7 +344,7 @@ else:
     st.info("Sin datos de países.")
 
 # ════════════════════════════════════════════════════════════════════════════
-# G5: URLs más leídas + autores — usa urls y prod (ya filtrados)
+# G5: URLs más leídas + autores (siempre refleja autor/cat filtrado)
 # ════════════════════════════════════════════════════════════════════════════
 sh("📰 URLs y Autores")
 n1,n2 = st.columns(2)
@@ -382,13 +432,15 @@ if not prod.empty and "is_ia" in prod.columns:
         st.info("No hay notas IA en el período seleccionado.")
 
 # ════════════════════════════════════════════════════════════════════════════
-# G9: Audiencia (tabs — carga dentro para evitar render innecesario)
+# G9: Audiencia
 # ════════════════════════════════════════════════════════════════════════════
 sh("👥 Audiencia")
 t1,t2,t3 = st.tabs(["👤 Edad","📱 Dispositivo","🎯 Intereses"])
 
 with t1:
-    if not age.empty and "userAgeBracket" in age.columns:
+    if has_aut:
+        st.info("ℹ️ Desglose por edad no disponible con filtro de autor.")
+    elif not age.empty and "userAgeBracket" in age.columns:
         a2=age.groupby("userAgeBracket",as_index=False).agg(U=("activeUsers","sum")).sort_values("userAgeBracket")
         fa=px.bar(a2,x="userAgeBracket",y="U",color="U",
             color_continuous_scale=["#14143a","#6366f1"],text="U")
@@ -399,7 +451,9 @@ with t1:
         st.info("Sin datos de edad.")
 
 with t2:
-    if not dev.empty and "deviceCategory" in dev.columns:
+    if has_aut:
+        st.info("ℹ️ Desglose por dispositivo no disponible con filtro de autor.")
+    elif not dev.empty and "deviceCategory" in dev.columns:
         da=dev.groupby("deviceCategory",as_index=False).agg(U=("activeUsers","sum"),V=("screenPageViews","sum"))
         d1,d2=st.columns(2)
         with d1:
