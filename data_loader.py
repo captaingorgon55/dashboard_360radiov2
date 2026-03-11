@@ -41,15 +41,11 @@ from urllib.parse import urlparse
 DATA_DIR = Path(".")   # archivos en raíz del proyecto
 
 
-# ── Detección automática del archivo GA4 disponible ─────────────────────────
+# ── Archivo GA4 — siempre usa v2 (extractor v3) ─────────────────────────────
 _GA4_V3 = DATA_DIR / "ga4_360radio_completo_v2.xlsx"
-_GA4_V1 = DATA_DIR / "ga4_360radio_completo.xlsx"
 
 def _ga4_file() -> str:
-    """Devuelve el nombre del Excel GA4 disponible (v3 tiene prioridad)."""
-    if _GA4_V3.exists(): return str(_GA4_V3)
-    if _GA4_V1.exists(): return str(_GA4_V1)
-    return str(_GA4_V3)   # no existe: deja que _read_excel devuelva vacío
+    return str(_GA4_V3)
 
 # Hojas por loader: lista en orden de prioridad [v3, v1_emoji, ...]
 _SHEETS = {
