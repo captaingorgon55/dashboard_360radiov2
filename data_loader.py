@@ -344,15 +344,27 @@ def load_admanager():
 
 @st.cache_data(ttl=3600)
 def load_youtube():
-    base = "Youtube historico.xlsx"
-    return {
-        "tabla":   _safe_numeric(
-            _read_excel(base, "Datos de la tabla"),
-            "Visualizaciones", "Impresiones", "Suscriptores", "Ingresos estimados (USD)"
-        ),
-        "grafico": _to_dt(_read_excel(base, "Datos del grafico"), "Fecha"),
-        "totales": _to_dt(_read_excel(base, "Totales"), "Fecha"),
-    }
+    base = "Youtube histórico.xlsx"
+    src = DATA_DIR / base
+    if not src.exists():
+        return {"tabla": pd.DataFrame(), "grafico": pd.DataFrame(), "totales": pd.DataFrame()}
+    # leer primera hoja directamente (sin importar el nombre)
+    try:
+        df = pd.read_excel(src, sheet_name=0)
+    except Exception:
+        try:
+            df = pd.read_excel(src, sheet_name=0, engine="openpyxl")
+        except Exception:
+            df = pd.DataFrame()
+    df = _safe_numeric(
+        df,
+        "Visualizaciones", "Impresiones", "Suscriptores",
+        "Ingresos estimados (USD)", "Tiempo de visualización (horas)",
+        "Porcentaje de clics de las impresiones (%)"
+    )
+    if "Hora de publicación del vídeo" in df.columns:
+        df = _to_dt(df, "Hora de publicación del vídeo")
+    return {"tabla": df, "grafico": pd.DataFrame(), "totales": pd.DataFrame()}
 
 
 # =============================================================================
