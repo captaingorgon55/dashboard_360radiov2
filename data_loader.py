@@ -1,5 +1,5 @@
 """
-data_loader.py  –  360Radio Analytics v3.1
+data_loader.py  –  360Radio Analytics v3.2
 ==========================================
 SOCIAL MEDIA: Lee Post Instagram.csv / Instagram Historys.csv / Post Facebook.csv
 generados por merge_social_csvs.py. Admite múltiples formatos de fecha.
@@ -10,6 +10,16 @@ MATCHING Produccion ↔ GA4 — 5 pasos en cascada:
   3. Título exacto normalizado
   4. Slug del pagePath == slug de la URL de producción
   5. Ratio de similitud ≥ 0.82 (Jaccard bigramas) vectorizado
+
+GA4 EXCEL — Hojas del extractor v2 (ga4_360radio_completo_v2.xlsx):
+  01_General_Diario      → load_ga4_general()
+  02_General_x_Device    → load_ga4_device()
+  04_General_x_Edad      → load_ga4_age()
+  05_General_x_Ciudad    → load_ga4_city()
+  06_General_x_Canal     → load_ga4_channel()
+  07_General_x_Pais      → load_ga4_country()
+  10_URLs_Diario         → load_ga4_urls()
+  15_BRANDING_General    → load_ga4_interests()
 """
 import re, unicodedata
 import pandas as pd
@@ -20,6 +30,24 @@ from urllib.parse import urlparse
 
 DATA_DIR = Path("data")
 
+# ── Nombre del Excel GA4 generado por extractor v2 ──────────────────────────
+GA4_FILE = "ga4_360radio_completo_v2.xlsx"
+
+# ── Mapa de hojas del extractor v2 ──────────────────────────────────────────
+GA4_SHEETS = {
+    "general":   "01_General_Diario",
+    "device":    "02_General_x_Device",
+    "age":       "04_General_x_Edad",
+    "city":      "05_General_x_Ciudad",
+    "channel":   "06_General_x_Canal",
+    "country":   "07_General_x_Pais",
+    "resumen":   "08_General_Resumen",
+    "fuente":    "09_Fuente_Medium",
+    "urls":      "10_URLs_Diario",
+    "interests": "15_BRANDING_General",
+}
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # HELPERS I/O
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -29,7 +57,7 @@ def _read_csv_robust(fname: str) -> pd.DataFrame:
     if not path.exists():
         return pd.DataFrame()
     for enc in ["utf-8", "utf-8-sig", "latin-1", "cp1252"]:
-        for sep in [",", ";", "\\t", "|"]:
+        for sep in [",", ";", "\t", "|"]:
             try:
                 df = pd.read_csv(path, encoding=enc, sep=sep, low_memory=False)
                 if len(df.columns) > 1:
@@ -69,22 +97,52 @@ def _safe_numeric(df: pd.DataFrame, *cols) -> pd.DataFrame:
     return df
 
 
+def _numeric_all_metrics(df: pd.DataFrame) -> pd.DataFrame:
+    """Convierte todas las columnas de métricas GA4 conocidas a numérico."""
+    GA4_METRIC_COLS = [
+        "activeUsers", "sessions", "screenPageViews",
+        "userEngagementDuration", "newUsers", "totalUsers",
+    ]
+    for c in GA4_METRIC_COLS:
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0)
+    return df
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# LOADER GA4 GENÉRICO
+# Lee una hoja del Excel v2, convierte fecha y métricas, y deduplica.
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _load_ga4_sheet(sheet_key: str, date_col: str = "date") -> pd.DataFrame:
+    sheet = GA4_SHEETS.get(sheet_key, sheet_key)
+    df = _read_excel(GA4_FILE, sheet)
+    if df.empty:
+        return df
+    df = _to_dt(df, date_col)
+    df = _numeric_all_metrics(df)
+    # Deduplicar: columnas de dimensión (no numéricas) + date
+    dim_cols = [c for c in df.columns
+                if not pd.api.types.is_numeric_dtype(df[c]) or c == date_col]
+    df = df.drop_duplicates(subset=dim_cols).copy().reset_index(drop=True)
+    return df
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # PARSER DE FECHA — multi-formato robusto
 # ═══════════════════════════════════════════════════════════════════════════════
 
 _DATE_FORMATS = [
-    "%b %d, %Y",           # ← YouTube Studio: "Feb 15, 2024"
+    "%b %d, %Y",
     "%m/%d/%Y %H:%M",
     "%Y-%m-%d %H:%M:%S",
     "%Y-%m-%dT%H:%M:%S",
     "%d/%m/%Y %H:%M",
     "%Y-%m-%d",
-    "%b %d, %Y %H:%M",    # ← variante con hora
+    "%b %d, %Y %H:%M",
 ]
 
 def _parse_fecha(series: pd.Series) -> pd.Series:
-    """Intenta múltiples formatos y finaliza con pd.to_datetime genérico."""
     result  = pd.Series(pd.NaT, index=series.index)
     pending = series.copy()
     for fmt in _DATE_FORMATS:
@@ -93,7 +151,6 @@ def _parse_fecha(series: pd.Series) -> pd.Series:
             break
         parsed = pd.to_datetime(pending[mask], format=fmt, errors="coerce")
         result[mask] = parsed
-    # Último recurso
     still_na = result.isna() & pending.notna()
     if still_na.any():
         result[still_na] = pd.to_datetime(pending[still_na], errors="coerce")
@@ -101,17 +158,8 @@ def _parse_fecha(series: pd.Series) -> pd.Series:
 
 
 def _parse_yt_pub_date(series: pd.Series) -> pd.Series:
-    """
-    Parsea 'Hora de publicación del vídeo' exportada por YouTube Studio.
-    Formatos conocidos:
-      - "Feb 15, 2024"
-      - "Feb 15, 2024, 10:30 AM"  (con hora)
-      - "2024-02-15"              (ISO, si viene de otra exportación)
-    Devuelve Series de datetime64 (NaT donde no parsea).
-    """
     result  = pd.Series(pd.NaT, index=series.index)
     pending = series.astype(str).str.strip()
-
     for fmt in [
         "%b %d, %Y",
         "%b %d, %Y, %I:%M %p",
@@ -125,12 +173,9 @@ def _parse_yt_pub_date(series: pd.Series) -> pd.Series:
             break
         parsed = pd.to_datetime(pending[mask], format=fmt, errors="coerce")
         result[mask] = parsed
-
-    # Último recurso genérico
     still_na = result.isna() & (pending != "nan") & (pending != "")
     if still_na.any():
         result[still_na] = pd.to_datetime(pending[still_na], errors="coerce", dayfirst=False)
-
     return result
 
 
@@ -146,14 +191,14 @@ def _norm_title(s) -> str:
     if pd.isna(s) or str(s).strip() == "":
         return ""
     t = _strip_accents(str(s).lower())
-    t = re.sub(r"[^\\w\\s]", " ", t)
-    t = re.sub(r"\\s+", " ", t)
+    t = re.sub(r"[^\w\s]", " ", t)
+    t = re.sub(r"\s+", " ", t)
     return t.strip()
 
 def _slug_from_path(path_str) -> str:
     if not path_str or pd.isna(path_str):
         return ""
-    parts = [p for p in str(path_str).split("/") if p and not re.match(r"^\\d+$", p)]
+    parts = [p for p in str(path_str).split("/") if p and not re.match(r"^\d+$", p)]
     return parts[-1].lower() if parts else ""
 
 def _slug_from_url(url_str) -> str:
@@ -167,10 +212,10 @@ def _post_id_from_path(path) -> "int | None":
     if not path or pd.isna(path):
         return None
     s = str(path).strip()
-    m = re.search(r"/(\\d{4,})/?(?:[?#].*)?$", s)
+    m = re.search(r"/(\d{4,})/?(?:[?#].*)?$", s)
     if m:
         return int(m.group(1))
-    m2 = re.search(r"[?&]p=(\\d+)", s)
+    m2 = re.search(r"[?&]p=(\d+)", s)
     return int(m2.group(1)) if m2 else None
 
 def _bigrams(s: str) -> set:
@@ -219,58 +264,89 @@ def _fuzzy_match_vectorized(prod_titles, ga4_titles, ga4_values, threshold=0.82)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# LOADERS
+# LOADERS GA4 — apuntan al Excel v2 mediante _load_ga4_sheet()
 # ═══════════════════════════════════════════════════════════════════════════════
 
 @st.cache_data(ttl=3600)
-def load_ga4_general():
-    return _to_dt(_read_excel("ga4_360radio_completo.xlsx", "📊_General_Diario"), "date")
+def load_ga4_general() -> pd.DataFrame:
+    """01_General_Diario — date, activeUsers, sessions, screenPageViews, userEngagementDuration"""
+    return _load_ga4_sheet("general")
 
 @st.cache_data(ttl=3600)
-def load_ga4_device():
-    return _to_dt(_read_excel("ga4_360radio_completo.xlsx", "📱_General_x_Device"), "date")
+def load_ga4_device() -> pd.DataFrame:
+    """02_General_x_Device — date, deviceCategory, activeUsers, ..., userEngagementDuration"""
+    return _load_ga4_sheet("device")
 
 @st.cache_data(ttl=3600)
-def load_ga4_age():
-    return _to_dt(_read_excel("ga4_360radio_completo.xlsx", "👤_General_x_Edad"), "date")
+def load_ga4_age() -> pd.DataFrame:
+    """04_General_x_Edad — date, userAgeBracket, activeUsers, ..."""
+    return _load_ga4_sheet("age")
 
 @st.cache_data(ttl=3600)
-def load_ga4_city():
-    return _to_dt(_read_excel("ga4_360radio_completo.xlsx", "🏙️_General_x_Ciudad"), "date")
+def load_ga4_city() -> pd.DataFrame:
+    """05_General_x_Ciudad — date, city, activeUsers, ..."""
+    return _load_ga4_sheet("city")
 
 @st.cache_data(ttl=3600)
-def load_ga4_channel():
-    return _to_dt(_read_excel("ga4_360radio_completo.xlsx", "🔗_General_x_Canal"), "date")
+def load_ga4_channel() -> pd.DataFrame:
+    """06_General_x_Canal — date, sessionDefaultChannelGroup, activeUsers, ..."""
+    return _load_ga4_sheet("channel")
 
 @st.cache_data(ttl=3600)
-def load_ga4_country():
-    return _to_dt(_read_excel("ga4_360radio_completo.xlsx", "🌎_General_x_Pais"), "date")
+def load_ga4_country() -> pd.DataFrame:
+    """07_General_x_Pais — date, country, activeUsers, ..."""
+    return _load_ga4_sheet("country")
 
 @st.cache_data(ttl=3600)
-def load_ga4_urls():
+def load_ga4_urls() -> pd.DataFrame:
+    """
+    10_URLs_Diario — date, pagePath, screenPageViews, userEngagementDuration, activeUsers
+    Fallback: archivo legacy ga4_data_360radio_urls.xlsx
+    """
+    df = _load_ga4_sheet("urls")
+    if not df.empty and "pagePath" in df.columns:
+        return df
+
+    # Fallback al Excel antiguo si existe
     for fname, sheet in [
         ("ga4_data_360radio_urls.xlsx", "URLs_x_Fecha_Diaria"),
         ("ga4_360radio_completo.xlsx",  "URLs_x_Fecha_Diaria"),
     ]:
-        df = _read_excel(fname, sheet)
-        if not df.empty and "pagePath" in df.columns:
-            return _safe_numeric(_to_dt(df, "date"), "screenPageViews", "activeUsers")
+        df_old = _read_excel(fname, sheet)
+        if not df_old.empty and "pagePath" in df_old.columns:
+            df_old = _to_dt(df_old, "date")
+            return _safe_numeric(df_old, "screenPageViews", "activeUsers",
+                                  "userEngagementDuration")
     return pd.DataFrame()
 
 @st.cache_data(ttl=3600)
-def load_ga4_interests():
+def load_ga4_interests() -> pd.DataFrame:
+    """
+    15_BRANDING_General — date, brandingInterest, activeUsers, userEngagementDuration
+    Fallback: Excel antiguo
+    """
+    df = _load_ga4_sheet("interests")
+    if not df.empty and "brandingInterest" in df.columns:
+        return df
+
     for fname, sheet in [
         ("ga4_data_360radio_urls.xlsx", "Intereses_Audiencia"),
         ("ga4_360radio_completo.xlsx",  "Intereses_Audiencia"),
     ]:
-        df = _read_excel(fname, sheet)
-        if not df.empty:
-            return _safe_numeric(df, "activeUsers", "sessions", "screenPageViews")
+        df_old = _read_excel(fname, sheet)
+        if not df_old.empty:
+            return _safe_numeric(df_old, "activeUsers", "sessions",
+                                  "screenPageViews", "userEngagementDuration")
     return pd.DataFrame()
 
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# LOADERS — Otros orígenes de datos
+# ═══════════════════════════════════════════════════════════════════════════════
+
 @st.cache_data(ttl=3600)
-def load_search_console():
-    base   = "search_console_360radio.xlsx"
+def load_search_console() -> dict:
+    base = "search_console_360radio.xlsx"
     sheets = {
         "daily":   ("📅_GSC_Diario",  "date"),
         "queries": ("🔍_GSC_Queries", "date"),
@@ -278,12 +354,14 @@ def load_search_console():
         "country": ("🌎_GSC_Pais",    "date"),
         "device":  ("📱_GSC_Device",  "date"),
     }
-    return {k: _to_dt(_read_excel(base, s), d) if not (r := _read_excel(base, s)).empty
-            else pd.DataFrame()
-            for k, (s, d) in sheets.items()}
+    result = {}
+    for k, (s, d) in sheets.items():
+        df = _read_excel(base, s)
+        result[k] = _to_dt(df, d) if not df.empty else pd.DataFrame()
+    return result
 
 @st.cache_data(ttl=3600)
-def load_produccion():
+def load_produccion() -> pd.DataFrame:
     df = _read_csv_robust("Produccion.csv")
     if df.empty:
         return df
@@ -292,21 +370,30 @@ def load_produccion():
     if "post_title" in df.columns: df["_title_norm"]  = df["post_title"].apply(_norm_title)
     if "url"        in df.columns:
         df["_prod_slug"] = df["url"].apply(_slug_from_url)
-        df["_prod_path"] = df["url"].apply(lambda u: urlparse(str(u)).path.rstrip("/") if pd.notna(u) else "")
+        df["_prod_path"] = df["url"].apply(
+            lambda u: urlparse(str(u)).path.rstrip("/") if pd.notna(u) else ""
+        )
     return df
 
 @st.cache_data(ttl=3600)
-def load_adsense():
+def load_adsense() -> pd.DataFrame:
     df = _read_csv_robust("Adsense.csv")
-    return _to_dt(_safe_numeric(df, "Estimated earnings (USD)", "Impressions", "Clicks", "Impression RPM (USD)"), "Date")
+    return _to_dt(
+        _safe_numeric(df, "Estimated earnings (USD)", "Impressions",
+                      "Clicks", "Impression RPM (USD)"),
+        "Date",
+    )
 
 @st.cache_data(ttl=3600)
-def load_mgid():
+def load_mgid() -> pd.DataFrame:
     df = _read_csv_robust("MGID.csv")
-    return _to_dt(_safe_numeric(df, "Revenue", "Page views", "Ad Clicks", "Ad RPM", "Ad vRPM"), "Date")
+    return _to_dt(
+        _safe_numeric(df, "Revenue", "Page views", "Ad Clicks", "Ad RPM", "Ad vRPM"),
+        "Date",
+    )
 
 @st.cache_data(ttl=3600)
-def load_admanager():
+def load_admanager() -> dict:
     base = "admanager_360radio.xlsx"
     return {
         "diario":   _to_dt(_read_excel(base, "GAM_Diario"),    "DATE"),
@@ -318,10 +405,9 @@ def load_admanager():
     }
 
 @st.cache_data(ttl=3600)
-def load_youtube():
+def load_youtube() -> dict:
     base = "Youtube histórico.xlsx"
 
-    # ── Tabla de videos (sin fecha diaria) ────────────────────────────────────
     tabla = _read_excel(base, "Datos de la tabla")
     if not tabla.empty:
         tabla = _safe_numeric(
@@ -330,12 +416,10 @@ def load_youtube():
             "Ingresos estimados (USD)", "Tiempo de visualización (horas)",
             "Porcentaje de clics de las impresiones (%)",
         )
-        # ✅ Normalizar "Hora de publicación del vídeo" → datetime limpio
         pub_col = "Hora de publicación del vídeo"
         if pub_col in tabla.columns:
             tabla[pub_col] = _parse_yt_pub_date(tabla[pub_col])
 
-    # ── Gráfico diario (tiene fecha) ──────────────────────────────────────────
     grafico = _read_excel(base, "Datos del gráfico")
     if not grafico.empty:
         grafico = _to_dt(grafico, "Fecha")
@@ -345,7 +429,6 @@ def load_youtube():
             "Impresiones", "Suscriptores",
         )
 
-    # ── Totales ───────────────────────────────────────────────────────────────
     totales = _read_excel(base, "Totales")
     if not totales.empty:
         totales = _to_dt(totales, "Fecha")
@@ -361,8 +444,8 @@ def load_youtube():
 # LOADERS REDES SOCIALES
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def _load_social_base(fname: str, num_cols: list, id_col: str = "identificador de la publicación") -> pd.DataFrame:
-    """Base compartida para Instagram Posts, Stories y Facebook."""
+def _load_social_base(fname: str, num_cols: list,
+                      id_col: str = "identificador de la publicación") -> pd.DataFrame:
     df = _read_csv_robust(fname)
     if df.empty:
         return df
@@ -370,14 +453,10 @@ def _load_social_base(fname: str, num_cols: list, id_col: str = "identificador d
         if old in df.columns and old != "id_post":
             df = df.rename(columns={old: "id_post"}); break
     hora_col = "Hora de publicación"
-    if hora_col in df.columns:
-        df["fecha_post"] = _parse_fecha(df[hora_col])
-    else:
-        df["fecha_post"] = pd.NaT
+    df["fecha_post"] = _parse_fecha(df[hora_col]) if hora_col in df.columns else pd.NaT
     df = df[df["fecha_post"].notna()].copy()
     df = _safe_numeric(df, *[c for c in num_cols if c in df.columns])
     return df.reset_index(drop=True)
-
 
 @st.cache_data(ttl=3600)
 def load_instagram_posts() -> pd.DataFrame:
@@ -390,7 +469,6 @@ def load_instagram_posts() -> pd.DataFrame:
         df = df[df["Tipo de publicación"].str.strip() != "Historia de Instagram"].copy()
     return df.reset_index(drop=True)
 
-
 @st.cache_data(ttl=3600)
 def load_instagram_stories() -> pd.DataFrame:
     return _load_social_base(
@@ -399,7 +477,6 @@ def load_instagram_stories() -> pd.DataFrame:
          "Respuestas", "Seguidores", "Navegación", "Toques en stickers",
          "Visitas al perfil"],
     )
-
 
 @st.cache_data(ttl=3600)
 def load_facebook() -> pd.DataFrame:
@@ -428,12 +505,14 @@ def load_produccion_con_metricas() -> pd.DataFrame:
     urls = load_ga4_urls()
     if prod.empty:
         return prod
+
     result = prod.copy()
     result["ga4_views"]    = np.nan
     result["ga4_users"]    = np.nan
     result["match_method"] = "sin_match"
+
     if urls.empty:
-        result[["ga4_views","ga4_users"]] = 0
+        result[["ga4_views", "ga4_users"]] = 0
         result["is_ia"] = False
         return result
 
@@ -441,7 +520,9 @@ def load_produccion_con_metricas() -> pd.DataFrame:
     if "pagePath" in urls_w.columns:
         urls_w["_ga4_post_id"] = urls_w["pagePath"].apply(_post_id_from_path)
         urls_w["_ga4_slug"]    = urls_w["pagePath"].apply(_slug_from_path)
-        urls_w["_ga4_clean"]   = urls_w["pagePath"].apply(lambda p: str(p).rstrip("/") if pd.notna(p) else "")
+        urls_w["_ga4_clean"]   = urls_w["pagePath"].apply(
+            lambda p: str(p).rstrip("/") if pd.notna(p) else ""
+        )
     if "pageTitle" in urls_w.columns:
         urls_w["_ga4_title"] = urls_w["pageTitle"].apply(_norm_title)
 
@@ -451,8 +532,8 @@ def load_produccion_con_metricas() -> pd.DataFrame:
         sub = sub[sub[key_col].astype(str) != ""]
         if sub.empty: return pd.DataFrame()
         kws = {}
-        if "screenPageViews" in sub.columns: kws["ga4_views"] = ("screenPageViews","sum")
-        if "activeUsers"     in sub.columns: kws["ga4_users"] = ("activeUsers","sum")
+        if "screenPageViews" in sub.columns: kws["ga4_views"] = ("screenPageViews", "sum")
+        if "activeUsers"     in sub.columns: kws["ga4_users"] = ("activeUsers",     "sum")
         if not kws: return pd.DataFrame()
         return sub.groupby(key_col, as_index=False).agg(**kws).rename(columns={key_col: rename_to})
 
@@ -473,20 +554,24 @@ def load_produccion_con_metricas() -> pd.DataFrame:
         result.loc[cond, "match_method"] = method_name
 
     if not ga4_by_id.empty    and "post_id"     in result.columns:
-        _assign(result[["post_id"]].merge(ga4_by_id, left_on="post_id", right_on="_key_id", how="left"), "post_id")
+        _assign(result[["post_id"]].merge(
+            ga4_by_id, left_on="post_id", right_on="_key_id", how="left"), "post_id")
     if not ga4_by_title.empty and "_title_norm" in result.columns:
-        _assign(result[["_title_norm"]].merge(ga4_by_title, left_on="_title_norm", right_on="_key_title", how="left"), "titulo_exacto")
+        _assign(result[["_title_norm"]].merge(
+            ga4_by_title, left_on="_title_norm", right_on="_key_title", how="left"), "titulo_exacto")
     if not ga4_by_slug.empty  and "_prod_slug"  in result.columns:
-        _assign(result[["_prod_slug"]].merge(ga4_by_slug, left_on="_prod_slug", right_on="_key_slug", how="left"), "slug")
+        _assign(result[["_prod_slug"]].merge(
+            ga4_by_slug, left_on="_prod_slug", right_on="_key_slug", how="left"), "slug")
     if not ga4_by_path.empty  and "_prod_path"  in result.columns:
-        _assign(result[["_prod_path"]].merge(ga4_by_path, left_on="_prod_path", right_on="_key_path", how="left"), "path_completo")
+        _assign(result[["_prod_path"]].merge(
+            ga4_by_path, left_on="_prod_path", right_on="_key_path", how="left"), "path_completo")
 
     no_match_mask = result["match_method"] == "sin_match"
     if no_match_mask.any() and not ga4_by_title.empty and "_title_norm" in result.columns:
         ga4_titles_list = ga4_by_title["_key_title"].fillna("").tolist()
         ga4_values_list = list(zip(
             ga4_by_title["ga4_views"].fillna(0).tolist(),
-            ga4_by_title.get("ga4_users", pd.Series(0, index=ga4_by_title.index)).fillna(0).tolist()
+            ga4_by_title.get("ga4_users", pd.Series(0, index=ga4_by_title.index)).fillna(0).tolist(),
         ))
         prod_no_match = result.loc[no_match_mask, "_title_norm"].tolist()
         fuzzy_results = _fuzzy_match_vectorized(prod_no_match, ga4_titles_list, ga4_values_list)
@@ -500,7 +585,9 @@ def load_produccion_con_metricas() -> pd.DataFrame:
     result["ga4_views"] = result["ga4_views"].fillna(0).astype(int)
     result["ga4_users"] = result["ga4_users"].fillna(0).astype(int)
     tags_col = result["tags"] if "tags" in result.columns else pd.Series("", index=result.index)
-    result["is_ia"] = tags_col.apply(lambda x: bool(re.search(r"\\bIA\\b|\\binteligencia[\\s_-]?artificial\\b", str(x), re.I)))
+    result["is_ia"] = tags_col.apply(
+        lambda x: bool(re.search(r"\bIA\b|\binteligencia[\s_-]?artificial\b", str(x), re.I))
+    )
     return result
 
 
@@ -520,12 +607,12 @@ def get_date_range(df: pd.DataFrame, col: str):
     from datetime import date as _d
     try:
         if df is None or df.empty or col not in df.columns:
-            return _d(2024,1,1), _d.today()
+            return _d(2024, 1, 1), _d.today()
         s = pd.to_datetime(df[col], errors="coerce").dropna()
-        return (s.min().date(), s.max().date()) if not s.empty else (_d(2024,1,1), _d.today())
+        return (s.min().date(), s.max().date()) if not s.empty else (_d(2024, 1, 1), _d.today())
     except Exception:
         from datetime import date as _d2
-        return _d2(2024,1,1), _d2.today()
+        return _d2(2024, 1, 1), _d2.today()
 
 def safe_sum(df, col) -> float:
     try:
