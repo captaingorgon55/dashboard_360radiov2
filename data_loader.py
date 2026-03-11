@@ -28,17 +28,13 @@ import streamlit as st
 from pathlib import Path
 from urllib.parse import urlparse
 
-DATA_DIR = Path(".")  # archivos en raíz del proyecto
+DATA_DIR = Path("data")
 
 # ── Nombre del Excel GA4 generado por extractor v2 ──────────────────────────
-# Usar v2 si existe, si no usar el original
-_ga4_v2   = Path(".") / "ga4_360radio_completo_v2.xlsx"
-_ga4_orig = Path(".") / "ga4_360radio_completo.xlsx"
-GA4_FILE = "ga4_360radio_completo_v2.xlsx" if _ga4_v2.exists() else "ga4_360radio_completo.xlsx"
+GA4_FILE = "ga4_360radio_completo_v2.xlsx"
 
 # ── Mapa de hojas del extractor v2 ──────────────────────────────────────────
-# Hojas del extractor v2 (nombres numéricos)
-GA4_SHEETS_V2 = {
+GA4_SHEETS = {
     "general":   "01_General_Diario",
     "device":    "02_General_x_Device",
     "age":       "04_General_x_Edad",
@@ -50,44 +46,6 @@ GA4_SHEETS_V2 = {
     "urls":      "10_URLs_Diario",
     "interests": "15_BRANDING_General",
 }
-# Hojas del extractor v1 (nombres con emojis) — fallback
-GA4_SHEETS_V1 = {
-    "general":   "📊_General_Diario",
-    "device":    "📱_General_x_Device",
-    "age":       "👤_General_x_Edad",
-    "city":      "🏙️_General_x_Ciudad",
-    "channel":   "🔗_General_x_Canal",
-    "country":   "🌎_General_x_Pais",
-    "resumen":   "📈_General_Resumen",
-    "fuente":    "🔍_Fuente_Medium",
-    "urls":      "🌐_URLs_Diario⏱️",
-    "interests": "🎯_BRANDING⏱️",
-}
-
-def _get_sheet(key: str) -> str:
-    """Devuelve el nombre de hoja correcto según el archivo disponible."""
-    if GA4_FILE.endswith("_v2.xlsx"):
-        return GA4_SHEETS_V2.get(key, key)
-    # Intentar v2 primero, luego v1
-    v2 = GA4_SHEETS_V2.get(key)
-    v1 = GA4_SHEETS_V1.get(key)
-    # Verificar cuál existe realmente
-    path = Path(".") / GA4_FILE
-    if path.exists():
-        try:
-            import openpyxl
-            wb = openpyxl.load_workbook(path, read_only=True, data_only=True)
-            sheet_names = wb.sheetnames
-            wb.close()
-            if v2 and v2 in sheet_names:
-                return v2
-            if v1 and v1 in sheet_names:
-                return v1
-        except Exception:
-            pass
-    return v2 or key
-
-GA4_SHEETS = GA4_SHEETS_V2  # referencia por compatibilidad
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -157,7 +115,7 @@ def _numeric_all_metrics(df: pd.DataFrame) -> pd.DataFrame:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def _load_ga4_sheet(sheet_key: str, date_col: str = "date") -> pd.DataFrame:
-    sheet = _get_sheet(sheet_key)
+    sheet = GA4_SHEETS.get(sheet_key, sheet_key)
     df = _read_excel(GA4_FILE, sheet)
     if df.empty:
         return df
