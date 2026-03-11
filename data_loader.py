@@ -186,7 +186,7 @@ _AUTHOR_ALIASES = {
     "juan camilo ocampo": "Juan Camilo Ocampo",
 }
 
-_IS_360RADIO_AUTHOR = re.compile(r"360\s*radio|radio\s*360|360radio", re.I)
+_IS_360RADIO_AUTHOR = re.compile(r"360\s*Radio|radio\s*360|360radio", re.I)
 
 
 def _is_generic_author(author_str) -> bool:
@@ -547,4 +547,5 @@ def pct_delta(cur, prev) -> "float | None":
 def _delta_str(cur, prev) -> "str | None":
     d = pct_delta(cur, prev)
     return f"{d:+.1f}%" if d is not None else None
+
 
