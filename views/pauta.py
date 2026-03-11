@@ -1,5 +1,4 @@
-import sys, os
-sys.path.insert(0, os.getcwd())
+import sys, os; sys.path.insert(0, os.getcwd())
 import streamlit as st
 import pandas as pd
 import numpy as np
