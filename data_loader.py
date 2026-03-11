@@ -174,13 +174,13 @@ def _slug_from_url(url_str) -> str:
 # Cuando post_author_name es "360 Radio" (o similar), buscar en tags
 # si aparece alguno de estos alias y reasignar el autor real.
 _AUTHOR_ALIASES = {
-    "andres m":           "Andres Martin",
+    "Andres M":           "Andres Martin",
     "andresm":            "Andres Martin",
     "andres martin":      "Andres Martin",
-    "julieth b":          "Julieth Barbosa",
+    "Julieth B":          "Julieth Barbosa",
     "juliethb":           "Julieth Barbosa",
     "julieth barbosa":    "Julieth Barbosa",
-    "juanocampo":         "Juan Camilo Ocampo",
+    "Juanocampo":         "Juan Camilo Ocampo",
     "juan ocampo":        "Juan Camilo Ocampo",
     "juan camilo":        "Juan Camilo Ocampo",
     "juan camilo ocampo": "Juan Camilo Ocampo",
@@ -547,3 +547,4 @@ def pct_delta(cur, prev) -> "float | None":
 def _delta_str(cur, prev) -> "str | None":
     d = pct_delta(cur, prev)
     return f"{d:+.1f}%" if d is not None else None
+
