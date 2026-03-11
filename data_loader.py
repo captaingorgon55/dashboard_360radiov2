@@ -168,8 +168,51 @@ def _slug_from_url(url_str) -> str:
 
 
 # =============================================================================
-# HELPERS  is_360radio / is_ia
+# HELPERS  is_360radio / is_ia / resolucion de autor
 # =============================================================================
+
+# Cuando post_author_name es "360 Radio" (o similar), buscar en tags
+# si aparece alguno de estos alias y reasignar el autor real.
+_AUTHOR_ALIASES = {
+    "andres m":           "Andres Martin",
+    "andresm":            "Andres Martin",
+    "andres martin":      "Andres Martin",
+    "julieth b":          "Julieth Barbosa",
+    "juliethb":           "Julieth Barbosa",
+    "julieth barbosa":    "Julieth Barbosa",
+    "juanocampo":         "Juan Camilo Ocampo",
+    "juan ocampo":        "Juan Camilo Ocampo",
+    "juan camilo":        "Juan Camilo Ocampo",
+    "juan camilo ocampo": "Juan Camilo Ocampo",
+}
+
+_IS_360RADIO_AUTHOR = re.compile(r"360\s*radio|radio\s*360|360radio", re.I)
+
+
+def _is_generic_author(author_str) -> bool:
+    if pd.isna(author_str):
+        return False
+    return bool(_IS_360RADIO_AUTHOR.search(str(author_str)))
+
+
+def _resolve_author(author_str, tags_str) -> str:
+    """
+    Si el autor es '360 Radio', busca en los tags algun alias conocido
+    y devuelve el nombre real. Si no encuentra nada, devuelve el autor original.
+    """
+    if not _is_generic_author(author_str):
+        return str(author_str) if pd.notna(author_str) else ""
+
+    if pd.isna(tags_str) or str(tags_str).strip() == "":
+        return str(author_str)
+
+    tags_norm = _strip_accents(str(tags_str).lower())
+    for alias, nombre_real in _AUTHOR_ALIASES.items():
+        if _strip_accents(alias) in tags_norm:
+            return nombre_real
+
+    return str(author_str)
+
 
 def _tags_contain_author(tags_str: str, author_str: str) -> bool:
     if not tags_str or not author_str or pd.isna(tags_str) or pd.isna(author_str):
@@ -394,11 +437,17 @@ def load_produccion_con_metricas() -> pd.DataFrame:
     # matching en cascada (matching_engine.py)
     result = match_production_to_ga4(prod, urls)
 
-    # flags is_ia / is_360radio
+    # flags is_ia / is_360radio + resolucion de autor
     tags_col   = result["tags"]             if "tags"             in result.columns \
                  else pd.Series("", index=result.index)
     author_col = result["post_author_name"] if "post_author_name" in result.columns \
                  else pd.Series("", index=result.index)
+
+    # Resolver autor real cuando es "360 Radio" y hay alias en tags
+    result["author_resolved"] = [
+        _resolve_author(a, t)
+        for a, t in zip(author_col, tags_col)
+    ]
 
     result["is_ia"] = tags_col.apply(
         lambda x: bool(re.search(r"s[ii]ntesis", str(x), re.I)))
