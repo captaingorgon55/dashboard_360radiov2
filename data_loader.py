@@ -2,33 +2,30 @@
 data_loader.py  –  360Radio Analytics v3.1
 ==========================================
 MATCHING Produccion ↔ GA4 — 5 pasos en cascada:
-  1. post_id  == último número ≥4 dígitos en pagePath   /slug/185001/
+  1. post_id  == último número ≥4 dígitos en pagePath
   2. post_id  == ?p=XXXXX  (legacy WP)
-  3. Título exacto normalizado  (strip acentos, minúsculas, puntuación)
+  3. Título exacto normalizado
   4. Slug del pagePath == slug de la URL de producción
-  5. Ratio de similitud ≥ 0.82 (Jaccard bigramas) — vectorizado con numpy
+  5. Ratio de similitud ≥ 0.82 (Jaccard bigramas) — vectorizado
 
-GA4 — Soporte automático extractor v3 (nuevo) y v1 (existente):
-  El loader detecta qué archivos y hojas están disponibles y usa el mejor.
+GA4 — ga4_360radio_completo_v2.xlsx (extractor v3):
 
-  Extractor v3 → ga4_360radio_completo_v2.xlsx:
-    10_General_Diario   → load_ga4_general()   [sessions, views, tiempo — SIN activeUsers]
-    04_General_x_Ciudad → load_ga4_city()       [activeUsers correcto, sin date]
-    05_General_x_Canal  → load_ga4_channel()    [activeUsers correcto, sin date]
-    06_General_x_Pais   → load_ga4_country()    [activeUsers correcto, sin date]
-    01_General_x_Device → load_ga4_device()     [activeUsers correcto, sin date]
-    03_General_x_Edad   → load_ga4_age()        [activeUsers correcto, sin date]
-    20_URLs_Diario      → load_ga4_urls()       [views, tiempo, sessions — SIN activeUsers]
-    30_BRANDING_General → load_ga4_interests()  [activeUsers correcto, sin date]
+  CON date (series temporales — SIN activeUsers):
+    10_General_Diario    date, sessions, screenPageViews, userEngagementDuration
+    11_Diario_x_Device   date, deviceCategory, sessions, ...
+    12_Diario_x_Ciudad   date, city, sessions, ...
+    13_Diario_x_Canal    date, sessionDefaultChannelGroup, sessions, ...
+    14_Diario_x_Pais     date, country, sessions, ...
+    20_URLs_Diario       date, pagePath, screenPageViews, userEngagementDuration, sessions
 
-  Extractor v1 → ga4_360radio_completo.xlsx (fallback):
-    📊_General_Diario / 📱_General_x_Device / 👤_General_x_Edad
-    🏙️_General_x_Ciudad / 🔗_General_x_Canal / 🌎_General_x_Pais
-    URLs_x_Fecha_Diaria / Intereses_Audiencia
-
-VELOCIDAD:
-  - Paso 5 vectorizado: 10x más rápido que loop Python puro
-  - Todos los loaders con @st.cache_data(ttl=3600)
+  SIN date (totales — activeUsers CORRECTO aquí):
+    01_General_x_Device  deviceCategory, activeUsers, sessions, ...
+    03_General_x_Edad    userAgeBracket, activeUsers, ...
+    04_General_x_Ciudad  city, activeUsers, ...
+    05_General_x_Canal   sessionDefaultChannelGroup, activeUsers, ...
+    06_General_x_Pais    country, activeUsers, ...
+    21_URLs_Top          pagePath, activeUsers, sessions, ...
+    30_BRANDING_General  brandingInterest, activeUsers, userEngagementDuration
 """
 import re, unicodedata
 import pandas as pd
@@ -39,46 +36,7 @@ from urllib.parse import urlparse
 
 
 DATA_DIR = Path(".")   # archivos en raíz del proyecto
-
-
-# ── Archivo GA4 — siempre usa v2 (extractor v3) ─────────────────────────────
-_GA4_V3 = DATA_DIR / "ga4_360radio_completo_v2.xlsx"
-
-def _ga4_file() -> str:
-    return str(_GA4_V3)
-
-# Hojas por loader: lista en orden de prioridad [v3, v1_emoji, ...]
-_SHEETS = {
-    "general":   ["10_General_Diario",     "01_General_Diario",   "📊_General_Diario"],
-    "device":    ["01_General_x_Device",   "02_General_x_Device", "📱_General_x_Device"],
-    "age":       ["03_General_x_Edad",     "04_General_x_Edad",   "👤_General_x_Edad"],
-    "city":      ["04_General_x_Ciudad",   "05_General_x_Ciudad", "🏙️_General_x_Ciudad"],
-    "channel":   ["05_General_x_Canal",    "06_General_x_Canal",  "🔗_General_x_Canal"],
-    "country":   ["06_General_x_Pais",     "07_General_x_Pais",   "🌎_General_x_Pais"],
-    "urls":      ["20_URLs_Diario",        "10_URLs_Diario",      "URLs_x_Fecha_Diaria"],
-    "interests": ["30_BRANDING_General",   "15_BRANDING_General", "Intereses_Audiencia"],
-}
-
-@st.cache_resource
-def _available_sheets() -> set:
-    """Lee las hojas del Excel GA4 una sola vez."""
-    path = _ga4_file()
-    try:
-        import openpyxl
-        wb = openpyxl.load_workbook(path, read_only=True, data_only=True)
-        names = set(wb.sheetnames)
-        wb.close()
-        return names
-    except Exception:
-        return set()
-
-def _best_sheet(key: str) -> str:
-    """Devuelve el primer nombre de hoja disponible en el Excel."""
-    available = _available_sheets()
-    for name in _SHEETS.get(key, []):
-        if name in available:
-            return name
-    return _SHEETS.get(key, [key])[0]
+GA4_FILE = "ga4_360radio_completo_v2.xlsx"
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -104,16 +62,14 @@ def _read_csv_robust(fname: str) -> pd.DataFrame:
 
 
 def _read_excel(fname: str, sheet: str) -> pd.DataFrame:
-    path = Path(fname) if Path(fname).is_absolute() else DATA_DIR / fname
-    # Admitir también rutas absolutas devueltas por _ga4_file()
-    if not Path(fname).exists() and not path.exists():
+    path = DATA_DIR / fname
+    if not path.exists():
         return pd.DataFrame()
-    target = Path(fname) if Path(fname).exists() else path
     try:
-        return pd.read_excel(target, sheet_name=sheet)
+        return pd.read_excel(path, sheet_name=sheet)
     except Exception:
         try:
-            return pd.read_excel(target, sheet_name=sheet, engine="openpyxl")
+            return pd.read_excel(path, sheet_name=sheet, engine="openpyxl")
         except Exception:
             return pd.DataFrame()
 
@@ -132,20 +88,15 @@ def _safe_numeric(df: pd.DataFrame, *cols) -> pd.DataFrame:
     return df
 
 
-def _load_ga4(key: str, date_col: str = "date") -> pd.DataFrame:
-    """
-    Loader genérico GA4: detecta archivo + hoja automáticamente,
-    convierte fecha y métricas numéricas.
-    """
-    sheet = _best_sheet(key)
-    df    = _read_excel(_ga4_file(), sheet)
+def _ga4(sheet: str, date_col: str = "date") -> pd.DataFrame:
+    """Lee una hoja del Excel v2 y normaliza fecha + métricas."""
+    df = _read_excel(GA4_FILE, sheet)
     if df.empty:
         return df
     if date_col and date_col in df.columns:
         df = _to_dt(df, date_col)
-    metric_cols = ["activeUsers","sessions","screenPageViews",
-                   "userEngagementDuration","newUsers","totalUsers"]
-    return _safe_numeric(df, *[c for c in metric_cols if c in df.columns])
+    metrics = ["activeUsers","sessions","screenPageViews","userEngagementDuration"]
+    return _safe_numeric(df, *[c for c in metrics if c in df.columns])
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -197,7 +148,7 @@ def _similarity_ratio(a: str, b: str) -> float:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# FUZZY MATCHING VECTORIZADO (Paso 5)
+# FUZZY MATCHING VECTORIZADO
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def _fuzzy_match_vectorized(prod_titles, ga4_titles, ga4_values, threshold=0.82):
@@ -230,68 +181,53 @@ def _fuzzy_match_vectorized(prod_titles, ga4_titles, ga4_values, threshold=0.82)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# LOADERS GA4
+# LOADERS GA4 — nombres exactos del Excel v2
 # ═══════════════════════════════════════════════════════════════════════════════
 
 @st.cache_data(ttl=3600)
 def load_ga4_general():
-    """Serie temporal — date, sessions, screenPageViews, userEngagementDuration."""
-    return _load_ga4("general")
+    """10_General_Diario — date, sessions, screenPageViews, userEngagementDuration"""
+    return _ga4("10_General_Diario")
 
 @st.cache_data(ttl=3600)
 def load_ga4_device():
-    """Por dispositivo — activeUsers correcto (sin date en v3)."""
-    return _load_ga4("device")
+    """01_General_x_Device — deviceCategory, activeUsers, sessions, ...  (sin date)"""
+    return _ga4("01_General_x_Device", date_col="")
 
 @st.cache_data(ttl=3600)
 def load_ga4_age():
-    """Por edad — activeUsers correcto (sin date en v3)."""
-    return _load_ga4("age")
+    """03_General_x_Edad — userAgeBracket, activeUsers, ...  (sin date)"""
+    return _ga4("03_General_x_Edad", date_col="")
 
 @st.cache_data(ttl=3600)
 def load_ga4_city():
-    """Por ciudad — activeUsers correcto (sin date en v3)."""
-    return _load_ga4("city")
+    """04_General_x_Ciudad — city, activeUsers, ...  (sin date)"""
+    return _ga4("04_General_x_Ciudad", date_col="")
 
 @st.cache_data(ttl=3600)
 def load_ga4_channel():
-    """Por canal — activeUsers correcto (sin date en v3)."""
-    return _load_ga4("channel")
+    """05_General_x_Canal — sessionDefaultChannelGroup, activeUsers, ...  (sin date)"""
+    return _ga4("05_General_x_Canal", date_col="")
 
 @st.cache_data(ttl=3600)
 def load_ga4_country():
-    """Por país — activeUsers correcto (sin date en v3)."""
-    return _load_ga4("country")
+    """06_General_x_Pais — country, activeUsers, ...  (sin date)"""
+    return _ga4("06_General_x_Pais", date_col="")
 
 @st.cache_data(ttl=3600)
 def load_ga4_urls():
-    """
-    URLs con fecha — screenPageViews, userEngagementDuration, sessions.
-    Fallback: ga4_data_360radio_urls.xlsx si no hay v3/v1.
-    """
-    df = _load_ga4("urls")
-    if not df.empty and "pagePath" in df.columns:
-        return df
-    # Fallback archivo legacy separado
-    legacy = _read_excel("ga4_data_360radio_urls.xlsx", "URLs_x_Fecha_Diaria")
-    if not legacy.empty and "pagePath" in legacy.columns:
-        return _safe_numeric(_to_dt(legacy, "date"),
-                             "screenPageViews", "activeUsers", "userEngagementDuration")
-    return pd.DataFrame()
+    """20_URLs_Diario — date, pagePath, screenPageViews, userEngagementDuration, sessions"""
+    return _ga4("20_URLs_Diario")
+
+@st.cache_data(ttl=3600)
+def load_ga4_urls_top():
+    """21_URLs_Top — pagePath, activeUsers, sessions, screenPageViews  (sin date)"""
+    return _ga4("21_URLs_Top", date_col="")
 
 @st.cache_data(ttl=3600)
 def load_ga4_interests():
-    """
-    Branding/intereses — activeUsers correcto (sin date en v3).
-    Fallback: archivo legacy.
-    """
-    df = _load_ga4("interests")
-    if not df.empty and "brandingInterest" in df.columns:
-        return df
-    legacy = _read_excel("ga4_data_360radio_urls.xlsx", "Intereses_Audiencia")
-    if not legacy.empty:
-        return _safe_numeric(legacy, "activeUsers", "sessions", "screenPageViews")
-    return pd.DataFrame()
+    """30_BRANDING_General — brandingInterest, activeUsers, userEngagementDuration  (sin date)"""
+    return _ga4("30_BRANDING_General", date_col="")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -452,6 +388,9 @@ def load_produccion_con_metricas() -> pd.DataFrame:
         result["is_ia"] = False
         return result
 
+    # Usar 21_URLs_Top para tener activeUsers por pagePath (sin date → correcto)
+    urls_top = load_ga4_urls_top()
+
     urls_w = urls.copy()
     if "pagePath" in urls_w.columns:
         urls_w["_ga4_post_id"] = urls_w["pagePath"].apply(_post_id_from_path)
@@ -461,57 +400,91 @@ def load_produccion_con_metricas() -> pd.DataFrame:
     if "pageTitle" in urls_w.columns:
         urls_w["_ga4_title"] = urls_w["pageTitle"].apply(_norm_title)
 
-    def _agg(key_col, rename_to):
+    # Para vistas: usar 20_URLs_Diario (screenPageViews aditivo)
+    # Para usuarios: usar 21_URLs_Top (activeUsers correcto sin date)
+    def _agg_views(key_col, rename_to):
         if key_col not in urls_w.columns: return pd.DataFrame()
         sub = urls_w.dropna(subset=[key_col])
         sub = sub[sub[key_col].astype(str) != ""]
         if sub.empty: return pd.DataFrame()
-        kws = {}
-        if "screenPageViews" in sub.columns: kws["ga4_views"] = ("screenPageViews","sum")
-        if "activeUsers"     in sub.columns: kws["ga4_users"] = ("activeUsers","sum")
-        if not kws: return pd.DataFrame()
-        return sub.groupby(key_col, as_index=False).agg(**kws).rename(columns={key_col: rename_to})
+        if "screenPageViews" not in sub.columns: return pd.DataFrame()
+        return (sub.groupby(key_col, as_index=False)
+                .agg(ga4_views=("screenPageViews","sum"))
+                .rename(columns={key_col: rename_to}))
 
-    ga4_by_id    = _agg("_ga4_post_id", "_key_id")
-    ga4_by_title = _agg("_ga4_title",   "_key_title")
-    ga4_by_slug  = _agg("_ga4_slug",    "_key_slug")
-    ga4_by_path  = _agg("_ga4_clean",   "_key_path")
-    if not ga4_by_id.empty:
-        ga4_by_id["_key_id"] = pd.to_numeric(ga4_by_id["_key_id"], errors="coerce")
+    def _agg_users_top(key_col, rename_to):
+        """activeUsers desde 21_URLs_Top (sin date → correcto)."""
+        if urls_top.empty or "pagePath" not in urls_top.columns: return pd.DataFrame()
+        if key_col == "_ga4_post_id":
+            urls_top["_key"] = urls_top["pagePath"].apply(_post_id_from_path)
+        elif key_col == "_ga4_slug":
+            urls_top["_key"] = urls_top["pagePath"].apply(_slug_from_path)
+        elif key_col == "_ga4_clean":
+            urls_top["_key"] = urls_top["pagePath"].apply(lambda p: str(p).rstrip("/") if pd.notna(p) else "")
+        else:
+            return pd.DataFrame()
+        sub = urls_top.dropna(subset=["_key"])
+        sub = sub[sub["_key"].astype(str) != ""]
+        if sub.empty or "activeUsers" not in sub.columns: return pd.DataFrame()
+        return (sub.groupby("_key", as_index=False)
+                .agg(ga4_users=("activeUsers","sum"))
+                .rename(columns={"_key": rename_to}))
 
-    def _assign(merged_df, method_name):
+    ga4_views_id   = _agg_views("_ga4_post_id", "_key_id")
+    ga4_views_slug = _agg_views("_ga4_slug",    "_key_slug")
+    ga4_views_path = _agg_views("_ga4_clean",   "_key_path")
+
+    if not ga4_views_id.empty:
+        ga4_views_id["_key_id"] = pd.to_numeric(ga4_views_id["_key_id"], errors="coerce")
+
+    def _assign_views(merged_df, key_col, method_name):
         no_match = result["match_method"] == "sin_match"
-        hit      = merged_df["ga4_views"].notna()
+        hit      = merged_df["ga4_views"].notna() & (merged_df["ga4_views"] > 0)
         cond     = no_match & hit
         if not cond.any(): return
         result.loc[cond, "ga4_views"]    = merged_df.loc[cond, "ga4_views"].values
-        result.loc[cond, "ga4_users"]    = merged_df.loc[cond, "ga4_users"].fillna(0).values
         result.loc[cond, "match_method"] = method_name
 
-    if not ga4_by_id.empty    and "post_id"     in result.columns:
-        _assign(result[["post_id"]].merge(ga4_by_id,    left_on="post_id",     right_on="_key_id",    how="left"), "post_id")
-    if not ga4_by_title.empty and "_title_norm" in result.columns:
-        _assign(result[["_title_norm"]].merge(ga4_by_title, left_on="_title_norm", right_on="_key_title", how="left"), "titulo_exacto")
-    if not ga4_by_slug.empty  and "_prod_slug"  in result.columns:
-        _assign(result[["_prod_slug"]].merge(ga4_by_slug,  left_on="_prod_slug",  right_on="_key_slug",  how="left"), "slug")
-    if not ga4_by_path.empty  and "_prod_path"  in result.columns:
-        _assign(result[["_prod_path"]].merge(ga4_by_path,  left_on="_prod_path",  right_on="_key_path",  how="left"), "path_completo")
+    # Asignar vistas
+    if not ga4_views_id.empty and "post_id" in result.columns:
+        _assign_views(result[["post_id"]].merge(ga4_views_id, left_on="post_id", right_on="_key_id", how="left"), "_key_id", "post_id")
+    if not ga4_views_slug.empty and "_prod_slug" in result.columns:
+        _assign_views(result[["_prod_slug"]].merge(ga4_views_slug, left_on="_prod_slug", right_on="_key_slug", how="left"), "_key_slug", "slug")
+    if not ga4_views_path.empty and "_prod_path" in result.columns:
+        _assign_views(result[["_prod_path"]].merge(ga4_views_path, left_on="_prod_path", right_on="_key_path", how="left"), "_key_path", "path_completo")
 
-    no_match_mask = result["match_method"] == "sin_match"
-    if no_match_mask.any() and not ga4_by_title.empty and "_title_norm" in result.columns:
-        ga4_titles_list = ga4_by_title["_key_title"].fillna("").tolist()
-        ga4_values_list = list(zip(
-            ga4_by_title["ga4_views"].fillna(0).tolist(),
-            ga4_by_title.get("ga4_users", pd.Series(0, index=ga4_by_title.index)).fillna(0).tolist()
-        ))
-        prod_no_match = result.loc[no_match_mask, "_title_norm"].tolist()
-        fuzzy_results = _fuzzy_match_vectorized(prod_no_match, ga4_titles_list, ga4_values_list)
-        idxs = result.index[no_match_mask]
-        for i, (v, u, method) in enumerate(fuzzy_results):
-            if method != "sin_match":
-                result.at[idxs[i], "ga4_views"]    = v
-                result.at[idxs[i], "ga4_users"]    = u
-                result.at[idxs[i], "match_method"] = method
+    # Asignar usuarios desde urls_top
+    for key_col, prod_col, rename_to in [
+        ("_ga4_post_id", "post_id",    "_key_id"),
+        ("_ga4_slug",    "_prod_slug", "_key_slug"),
+        ("_ga4_clean",   "_prod_path", "_key_path"),
+    ]:
+        if prod_col not in result.columns: continue
+        users_df = _agg_users_top(key_col, rename_to)
+        if users_df.empty: continue
+        if rename_to == "_key_id":
+            users_df[rename_to] = pd.to_numeric(users_df[rename_to], errors="coerce")
+        merged = result[[prod_col]].merge(users_df, left_on=prod_col, right_on=rename_to, how="left")
+        has_user = merged["ga4_users"].notna()
+        result.loc[has_user, "ga4_users"] = merged.loc[has_user, "ga4_users"].values
+
+    # Fuzzy matching para los sin_match con título
+    if "pageTitle" in urls_w.columns:
+        ga4_by_title = (urls_w.dropna(subset=["_ga4_title"])
+                        .groupby("_ga4_title", as_index=False)
+                        .agg(ga4_views=("screenPageViews","sum")))
+        no_match_mask = result["match_method"] == "sin_match"
+        if no_match_mask.any() and not ga4_by_title.empty and "_title_norm" in result.columns:
+            ga4_titles_list = ga4_by_title["_ga4_title"].fillna("").tolist()
+            ga4_values_list = list(zip(ga4_by_title["ga4_views"].fillna(0).tolist(),
+                                       [0]*len(ga4_by_title)))
+            prod_no_match = result.loc[no_match_mask, "_title_norm"].tolist()
+            fuzzy_results = _fuzzy_match_vectorized(prod_no_match, ga4_titles_list, ga4_values_list)
+            idxs = result.index[no_match_mask]
+            for i, (v, u, method) in enumerate(fuzzy_results):
+                if method != "sin_match":
+                    result.at[idxs[i], "ga4_views"]    = v
+                    result.at[idxs[i], "match_method"] = method
 
     result["ga4_views"] = result["ga4_views"].fillna(0).astype(int)
     result["ga4_users"] = result["ga4_users"].fillna(0).astype(int)
