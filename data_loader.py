@@ -1,5 +1,5 @@
 """
-data_loader.py  –  360Radio Analytics v3.2
+data_loader.py  –  360Radio Analytics v3.3
 ==========================================
 SOCIAL MEDIA: Lee Post Instagram.csv / Instagram Historys.csv / Post Facebook.csv
 generados por merge_social_csvs.py. Admite múltiples formatos de fecha.
@@ -11,15 +11,35 @@ MATCHING Produccion ↔ GA4 — 5 pasos en cascada:
   4. Slug del pagePath == slug de la URL de producción
   5. Ratio de similitud ≥ 0.82 (Jaccard bigramas) vectorizado
 
-GA4 EXCEL — Hojas del extractor v2 (ga4_360radio_completo_v2.xlsx):
-  01_General_Diario      → load_ga4_general()
-  02_General_x_Device    → load_ga4_device()
-  04_General_x_Edad      → load_ga4_age()
-  05_General_x_Ciudad    → load_ga4_city()
-  06_General_x_Canal     → load_ga4_channel()
-  07_General_x_Pais      → load_ga4_country()
-  10_URLs_Diario         → load_ga4_urls()
-  15_BRANDING_General    → load_ga4_interests()
+GA4 EXCEL — Hojas del extractor v3 (ga4_360radio_completo_v2.xlsx):
+
+  TOTALES (sin date) — activeUsers CORRECTO aquí:
+  01_General_x_Device    → load_ga4_device()
+  02_General_x_Genero    → load_ga4_gender()
+  03_General_x_Edad      → load_ga4_age()
+  04_General_x_Ciudad    → load_ga4_city()
+  05_General_x_Canal     → load_ga4_channel()
+  06_General_x_Pais      → load_ga4_country()
+  07_General_Resumen     → (interno)
+  08_Fuente_Medium       → (interno)
+
+  SERIE TEMPORAL (con date) — SIN activeUsers:
+  10_General_Diario      → load_ga4_general()   [sessions, views, tiempo]
+  11_Diario_x_Device     → load_ga4_device_daily()
+  12_Diario_x_Ciudad     → load_ga4_city_daily()
+  13_Diario_x_Canal      → load_ga4_channel_daily()
+
+  URLs:
+  20_URLs_Diario         → load_ga4_urls()       [screenPageViews, tiempo, sessions]
+  21_URLs_Top            → load_ga4_urls_top()   [+ activeUsers porque sin date]
+
+  BRANDING:
+  30_BRANDING_General    → load_ga4_interests()
+
+REGLA CLAVE:
+  activeUsers NO es aditivo por fecha.
+  En series temporales usar: sessions + screenPageViews + userEngagementDuration.
+  activeUsers válido SOLO en hojas SIN dimensión date.
 """
 import re, unicodedata
 import pandas as pd
@@ -28,24 +48,62 @@ import streamlit as st
 from pathlib import Path
 from urllib.parse import urlparse
 
-DATA_DIR = Path("data")
+DATA_DIR = Path(".")  # archivos en raíz del proyecto
 
 # ── Nombre del Excel GA4 generado por extractor v2 ──────────────────────────
-GA4_FILE = "ga4_360radio_completo_v2.xlsx"
+# Usar v2 si existe, si no usar el original
+_ga4_v2   = Path(".") / "ga4_360radio_completo_v2.xlsx"
+_ga4_orig = Path(".") / "ga4_360radio_completo.xlsx"
+GA4_FILE = "ga4_360radio_completo_v2.xlsx" if _ga4_v2.exists() else "ga4_360radio_completo.xlsx"
 
-# ── Mapa de hojas del extractor v2 ──────────────────────────────────────────
+# ── Mapa de hojas (extractor v3 → nombres numéricos) ────────────────────────
+# Fallbacks en orden: v3 → v2 → v1 (emojis)
 GA4_SHEETS = {
-    "general":   "01_General_Diario",
-    "device":    "02_General_x_Device",
-    "age":       "04_General_x_Edad",
-    "city":      "05_General_x_Ciudad",
-    "channel":   "06_General_x_Canal",
-    "country":   "07_General_x_Pais",
-    "resumen":   "08_General_Resumen",
-    "fuente":    "09_Fuente_Medium",
-    "urls":      "10_URLs_Diario",
-    "interests": "15_BRANDING_General",
+    # Totales sin date (activeUsers correcto)
+    "device":         ["01_General_x_Device",   "02_General_x_Device",   "📱_General_x_Device"],
+    "gender":         ["02_General_x_Genero",    "03_General_x_Genero",   "⚤_General_x_Genero"],
+    "age":            ["03_General_x_Edad",      "04_General_x_Edad",     "👤_General_x_Edad"],
+    "city":           ["04_General_x_Ciudad",    "05_General_x_Ciudad",   "🏙️_General_x_Ciudad"],
+    "channel":        ["05_General_x_Canal",     "06_General_x_Canal",    "🔗_General_x_Canal"],
+    "country":        ["06_General_x_Pais",      "07_General_x_Pais",     "🌎_General_x_Pais"],
+    "resumen":        ["07_General_Resumen",     "08_General_Resumen",    "📈_General_Resumen"],
+    "fuente":         ["08_Fuente_Medium",       "09_Fuente_Medium",      "🔍_Fuente_Medium"],
+    # Serie temporal con date (SIN activeUsers)
+    "general":        ["10_General_Diario",      "01_General_Diario",     "📊_General_Diario"],
+    "city_daily":     ["12_Diario_x_Ciudad",     "05_General_x_Ciudad",   "🏙️_General_x_Ciudad"],
+    "channel_daily":  ["13_Diario_x_Canal",      "06_General_x_Canal",    "🔗_General_x_Canal"],
+    # URLs
+    "urls":           ["20_URLs_Diario",         "10_URLs_Diario",        "🌐_URLs_Diario⏱️"],
+    "urls_top":       ["21_URLs_Top",            "13_URLs_Top",           "⭐_URLs_Top⏱️"],
+    # Branding
+    "interests":      ["30_BRANDING_General",    "15_BRANDING_General",   "🎯_BRANDING⏱️"],
 }
+
+@st.cache_resource
+def _get_sheet_names_cached() -> list:
+    """Lee las hojas disponibles del Excel GA4 una sola vez."""
+    path = Path(".") / GA4_FILE
+    if not path.exists():
+        return []
+    try:
+        import openpyxl
+        wb = openpyxl.load_workbook(path, read_only=True, data_only=True)
+        names = wb.sheetnames
+        wb.close()
+        return names
+    except Exception:
+        return []
+
+def _get_sheet(key: str) -> str:
+    """Devuelve el primer nombre de hoja que exista en el Excel."""
+    candidates = GA4_SHEETS.get(key, [key])
+    available  = _get_sheet_names_cached()
+    if not available:
+        return candidates[0]
+    for name in candidates:
+        if name in available:
+            return name
+    return candidates[0]  # fallback aunque no exista
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -115,13 +173,15 @@ def _numeric_all_metrics(df: pd.DataFrame) -> pd.DataFrame:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def _load_ga4_sheet(sheet_key: str, date_col: str = "date") -> pd.DataFrame:
-    sheet = GA4_SHEETS.get(sheet_key, sheet_key)
+    sheet = _get_sheet(sheet_key)
     df = _read_excel(GA4_FILE, sheet)
     if df.empty:
         return df
-    df = _to_dt(df, date_col)
+    # Convertir fecha solo si la columna existe (hojas sin date no la tienen)
+    if date_col in df.columns:
+        df = _to_dt(df, date_col)
     df = _numeric_all_metrics(df)
-    # Deduplicar: columnas de dimensión (no numéricas) + date
+    # Deduplicar por columnas de dimensión
     dim_cols = [c for c in df.columns
                 if not pd.api.types.is_numeric_dtype(df[c]) or c == date_col]
     df = df.drop_duplicates(subset=dim_cols).copy().reset_index(drop=True)
@@ -269,45 +329,81 @@ def _fuzzy_match_vectorized(prod_titles, ga4_titles, ga4_values, threshold=0.82)
 
 @st.cache_data(ttl=3600)
 def load_ga4_general() -> pd.DataFrame:
-    """01_General_Diario — date, activeUsers, sessions, screenPageViews, userEngagementDuration"""
+    """
+    10_General_Diario — date, sessions, screenPageViews, userEngagementDuration
+    ⚠️ SIN activeUsers: no es aditivo con dimensión date.
+    Usar sessions/screenPageViews para evolución temporal.
+    """
     return _load_ga4_sheet("general")
 
 @st.cache_data(ttl=3600)
 def load_ga4_device() -> pd.DataFrame:
-    """02_General_x_Device — date, deviceCategory, activeUsers, ..., userEngagementDuration"""
-    return _load_ga4_sheet("device")
+    """
+    01_General_x_Device — deviceCategory, activeUsers, sessions, ...
+    Sin date → activeUsers CORRECTO aquí.
+    """
+    return _load_ga4_sheet("device", date_col="")
 
 @st.cache_data(ttl=3600)
 def load_ga4_age() -> pd.DataFrame:
-    """04_General_x_Edad — date, userAgeBracket, activeUsers, ..."""
-    return _load_ga4_sheet("age")
+    """
+    03_General_x_Edad — userAgeBracket, activeUsers, ...
+    Sin date → activeUsers CORRECTO aquí.
+    """
+    return _load_ga4_sheet("age", date_col="")
 
 @st.cache_data(ttl=3600)
 def load_ga4_city() -> pd.DataFrame:
-    """05_General_x_Ciudad — date, city, activeUsers, ..."""
-    return _load_ga4_sheet("city")
+    """
+    04_General_x_Ciudad — city, activeUsers, ...
+    Sin date → activeUsers CORRECTO aquí.
+    Para serie temporal usar load_ga4_city_daily().
+    """
+    return _load_ga4_sheet("city", date_col="")
+
+@st.cache_data(ttl=3600)
+def load_ga4_city_daily() -> pd.DataFrame:
+    """
+    12_Diario_x_Ciudad — date, city, sessions, screenPageViews, userEngagementDuration
+    CON date → SIN activeUsers.
+    """
+    return _load_ga4_sheet("city_daily")
 
 @st.cache_data(ttl=3600)
 def load_ga4_channel() -> pd.DataFrame:
-    """06_General_x_Canal — date, sessionDefaultChannelGroup, activeUsers, ..."""
-    return _load_ga4_sheet("channel")
+    """
+    05_General_x_Canal — sessionDefaultChannelGroup, activeUsers, ...
+    Sin date → activeUsers CORRECTO aquí.
+    """
+    return _load_ga4_sheet("channel", date_col="")
+
+@st.cache_data(ttl=3600)
+def load_ga4_channel_daily() -> pd.DataFrame:
+    """
+    13_Diario_x_Canal — date, sessionDefaultChannelGroup, sessions, ...
+    CON date → SIN activeUsers.
+    """
+    return _load_ga4_sheet("channel_daily")
 
 @st.cache_data(ttl=3600)
 def load_ga4_country() -> pd.DataFrame:
-    """07_General_x_Pais — date, country, activeUsers, ..."""
-    return _load_ga4_sheet("country")
+    """
+    06_General_x_Pais — country, activeUsers, ...
+    Sin date → activeUsers CORRECTO aquí.
+    """
+    return _load_ga4_sheet("country", date_col="")
 
 @st.cache_data(ttl=3600)
 def load_ga4_urls() -> pd.DataFrame:
     """
-    10_URLs_Diario — date, pagePath, screenPageViews, userEngagementDuration, activeUsers
-    Fallback: archivo legacy ga4_data_360radio_urls.xlsx
+    20_URLs_Diario — date, pagePath, screenPageViews, userEngagementDuration, sessions
+    CON date → SIN activeUsers (no aditivo).
+    Paginado en el extractor v3 → todas las URLs sin corte de 10k.
     """
     df = _load_ga4_sheet("urls")
     if not df.empty and "pagePath" in df.columns:
         return df
-
-    # Fallback al Excel antiguo si existe
+    # Fallback archivos legacy
     for fname, sheet in [
         ("ga4_data_360radio_urls.xlsx", "URLs_x_Fecha_Diaria"),
         ("ga4_360radio_completo.xlsx",  "URLs_x_Fecha_Diaria"),
@@ -315,28 +411,34 @@ def load_ga4_urls() -> pd.DataFrame:
         df_old = _read_excel(fname, sheet)
         if not df_old.empty and "pagePath" in df_old.columns:
             df_old = _to_dt(df_old, "date")
-            return _safe_numeric(df_old, "screenPageViews", "activeUsers",
-                                  "userEngagementDuration")
+            return _safe_numeric(df_old, "screenPageViews", "userEngagementDuration", "sessions")
     return pd.DataFrame()
+
+@st.cache_data(ttl=3600)
+def load_ga4_urls_top() -> pd.DataFrame:
+    """
+    21_URLs_Top — pagePath, activeUsers, sessions, screenPageViews, userEngagementDuration
+    Sin date → activeUsers CORRECTO aquí.
+    """
+    return _load_ga4_sheet("urls_top", date_col="")
 
 @st.cache_data(ttl=3600)
 def load_ga4_interests() -> pd.DataFrame:
     """
-    15_BRANDING_General — date, brandingInterest, activeUsers, userEngagementDuration
-    Fallback: Excel antiguo
+    30_BRANDING_General — brandingInterest, activeUsers, userEngagementDuration
+    Sin date → activeUsers CORRECTO aquí.
     """
-    df = _load_ga4_sheet("interests")
+    df = _load_ga4_sheet("interests", date_col="")
     if not df.empty and "brandingInterest" in df.columns:
         return df
-
+    # Fallback
     for fname, sheet in [
         ("ga4_data_360radio_urls.xlsx", "Intereses_Audiencia"),
         ("ga4_360radio_completo.xlsx",  "Intereses_Audiencia"),
     ]:
         df_old = _read_excel(fname, sheet)
         if not df_old.empty:
-            return _safe_numeric(df_old, "activeUsers", "sessions",
-                                  "screenPageViews", "userEngagementDuration")
+            return _safe_numeric(df_old, "activeUsers", "userEngagementDuration")
     return pd.DataFrame()
 
 
