@@ -173,20 +173,26 @@ def _slug_from_url(url_str) -> str:
 
 # Cuando post_author_name es "360 Radio" (o similar), buscar en tags
 # si aparece alguno de estos alias y reasignar el autor real.
+# Todos los alias en minúsculas sin tildes — la comparación es case-insensitive
+# porque tanto alias como tags pasan por _strip_accents().lower()
 _AUTHOR_ALIASES = {
-    "Andres M":           "Andres Martin",
+    # Andres Martin
+    "andres m":           "Andres Martin",
     "andresm":            "Andres Martin",
     "andres martin":      "Andres Martin",
-    "Julieth B":          "Julieth Barbosa",
+    # Julieth Barbosa
+    "julieth b":          "Julieth Barbosa",
     "juliethb":           "Julieth Barbosa",
     "julieth barbosa":    "Julieth Barbosa",
-    "Juanocampo":         "Juan Camilo Ocampo",
+    # Juan Camilo Ocampo
+    "juanocampo":         "Juan Camilo Ocampo",
     "juan ocampo":        "Juan Camilo Ocampo",
     "juan camilo":        "Juan Camilo Ocampo",
     "juan camilo ocampo": "Juan Camilo Ocampo",
+    "ocampo":             "Juan Camilo Ocampo",
 }
 
-_IS_360RADIO_AUTHOR = re.compile(r"360\s*Radio|radio\s*360|360radio", re.I)
+_IS_360RADIO_AUTHOR = re.compile(r"360\s*radio|radio\s*360|360radio", re.I)
 
 
 def _is_generic_author(author_str) -> bool:
@@ -309,8 +315,10 @@ def load_produccion():
         df["_title_norm"] = df["post_title"].apply(_norm_title)
     if "url" in df.columns:
         df["_prod_slug"]  = df["url"].apply(_slug_from_url)
+        # quitar dominio completo para que el path matchee con GA4
+        # ej: https://360radio.com.co/nota/titulo/ -> /nota/titulo
         df["_prod_path"]  = df["url"].apply(
-            lambda u: urlparse(str(u)).path.rstrip("/") if pd.notna(u) else "")
+            lambda u: urlparse(str(u)).path.rstrip("/").lower() if pd.notna(u) else "")
     return df
 
 
@@ -362,8 +370,19 @@ def load_youtube():
         "Ingresos estimados (USD)", "Tiempo de visualización (horas)",
         "Porcentaje de clics de las impresiones (%)"
     )
-    if "Hora de publicación del vídeo" in df.columns:
-        df = _to_dt(df, "Hora de publicación del vídeo")
+    # Parsear fecha — formato real: "Mar 13, 2026" o "Mar 13 , 2026"
+    fecha_col = "Hora de publicación del vídeo"
+    if fecha_col in df.columns:
+        raw = df[fecha_col].astype(str).str.strip()
+        # normalizar espacios antes de la coma: "Mar 13 , 2026" -> "Mar 13, 2026"
+        raw = raw.str.replace(r"\s*,\s*", ", ", regex=True)
+        df[fecha_col] = pd.to_datetime(raw, format="%b %d, %Y", errors="coerce")
+        # fallback para otras variantes
+        mask = df[fecha_col].isna()
+        if mask.any():
+            df.loc[mask, fecha_col] = pd.to_datetime(
+                raw[mask], errors="coerce", dayfirst=False
+            )
     return {"tabla": df, "grafico": pd.DataFrame(), "totales": pd.DataFrame()}
 
 
@@ -547,5 +566,3 @@ def pct_delta(cur, prev) -> "float | None":
 def _delta_str(cur, prev) -> "str | None":
     d = pct_delta(cur, prev)
     return f"{d:+.1f}%" if d is not None else None
-
-
