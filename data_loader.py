@@ -1,37 +1,83 @@
 """
-data_loader.py  –  360Radio Analytics v4.0
-==========================================
-SOCIAL MEDIA: Lee Post Instagram.csv / Instagram Historys.csv / Post Facebook.csv
-generados por merge_social_csvs.py. Admite múltiples formatos de fecha.
-
-MATCHING Produccion ↔ GA4 — 12 pasos en cascada (ver matching_engine.py):
-  1.  post_id  == último número ≥4 dígitos en pagePath          (exacto)
-  2.  post_id  == ?p=XXXXX  (legacy WP)                         (exacto)
-  3.  Título exacto normalizado                                  (exacto)
-  4.  Path completo normalizado                                  (exacto)
-  5.  Slug final del pagePath == slug de URL de producción       (exacto)
-  6.  Slug sin stop-words                                        (exacto)
-  7.  Variantes de slug (guiones, plural/singular naive)         (heurístico)
-  8.  Token-set ratio ≥ 0.90 sobre títulos                       (fuzzy)
-  9.  Jaccard bigramas ≥ 0.82                                    (fuzzy)
- 10.  Jaccard trigramas ≥ 0.78                                   (fuzzy)
- 11.  LCS normalizado ≥ 0.85                                     (fuzzy)
- 12.  TF-IDF coseno ≥ 0.80                                       (semántico)
+data_loader.py  -  360Radio Analytics v4.2  (FAST I/O)
+=======================================================
+Optimizaciones v4.2:
+  * _read_excel: convierte Excel -> Parquet la primera vez (10-50x mas rapido
+    en lecturas siguientes). El parquet se invalida si el Excel cambia (mtime).
+  * load_ga4_urls + load_produccion corren en paralelo (ThreadPoolExecutor)
+    antes del matching, ahorrando el tiempo del mas lento.
+  * Produccion.csv filtrado desde 2025-01-01 para reducir volumen.
+  * Matching engine v4.1 con early-exit y fuzzy vectorizado.
 """
-import re, unicodedata
-import pandas as pd
-import numpy as np
-import streamlit as st
+import re
+import unicodedata
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from urllib.parse import urlparse
 
+import numpy as np
+import pandas as pd
+import streamlit as st
+
 from matching_engine import match_production_to_ga4, match_stats  # noqa: F401
 
-DATA_DIR = Path("data")
+DATA_DIR  = Path("data")
+CACHE_DIR = Path(".parquet_cache")
+CACHE_DIR.mkdir(exist_ok=True)
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# HELPERS I/O
-# ═══════════════════════════════════════════════════════════════════════════════
+PRODUCCION_DESDE = pd.Timestamp("2025-01-01")
+
+
+# =============================================================================
+# HELPERS I/O  —  con cache parquet para Excel
+# =============================================================================
+
+def _parquet_path(fname: str, sheet: str) -> Path:
+    safe = re.sub(r"[^\w]", "_", f"{fname}__{sheet}")
+    return CACHE_DIR / f"{safe}.parquet"
+
+
+def _read_excel(fname: str, sheet: str) -> pd.DataFrame:
+    """
+    Lee un sheet de Excel. Si ya existe un parquet mas reciente que el Excel,
+    lo usa directamente (10-50x mas rapido). Si no, lee el Excel y guarda parquet.
+    """
+    src = DATA_DIR / fname
+    if not src.exists():
+        return pd.DataFrame()
+
+    pq = _parquet_path(fname, sheet)
+    src_mtime = src.stat().st_mtime
+
+    # usar parquet si existe y es mas nuevo que el Excel
+    if pq.exists() and pq.stat().st_mtime >= src_mtime:
+        try:
+            return pd.read_parquet(pq)
+        except Exception:
+            pq.unlink(missing_ok=True)
+
+    # leer Excel y guardar parquet
+    df = pd.DataFrame()
+    for engine in [None, "openpyxl", "xlrd"]:
+        try:
+            kw = {"engine": engine} if engine else {}
+            df = pd.read_excel(src, sheet_name=sheet, **kw)
+            break
+        except Exception:
+            continue
+
+    if not df.empty:
+        try:
+            # parquet no acepta columnas duplicadas ni tipos mixtos
+            df = df.loc[:, ~df.columns.duplicated()]
+            for col in df.select_dtypes(include="object").columns:
+                df[col] = df[col].astype(str)
+            df.to_parquet(pq, index=False)
+        except Exception:
+            pass  # si no se puede guardar parquet, igual retornamos el df
+
+    return df
+
 
 def _read_csv_robust(fname: str) -> pd.DataFrame:
     path = DATA_DIR / fname
@@ -51,19 +97,6 @@ def _read_csv_robust(fname: str) -> pd.DataFrame:
         return pd.DataFrame()
 
 
-def _read_excel(fname: str, sheet: str) -> pd.DataFrame:
-    path = DATA_DIR / fname
-    if not path.exists():
-        return pd.DataFrame()
-    try:
-        return pd.read_excel(path, sheet_name=sheet)
-    except Exception:
-        try:
-            return pd.read_excel(path, sheet_name=sheet, engine="openpyxl")
-        except Exception:
-            return pd.DataFrame()
-
-
 def _to_dt(df: pd.DataFrame, col: str) -> pd.DataFrame:
     if not df.empty and col in df.columns:
         df = df.copy()
@@ -78,9 +111,9 @@ def _safe_numeric(df: pd.DataFrame, *cols) -> pd.DataFrame:
     return df
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# PARSER DE FECHA — multi-formato robusto
-# ═══════════════════════════════════════════════════════════════════════════════
+# =============================================================================
+# PARSER DE FECHA  —  multi-formato robusto
+# =============================================================================
 
 _DATE_FORMATS = [
     "%m/%d/%Y %H:%M",
@@ -89,6 +122,7 @@ _DATE_FORMATS = [
     "%d/%m/%Y %H:%M",
     "%Y-%m-%d",
 ]
+
 
 def _parse_fecha(series: pd.Series) -> pd.Series:
     result  = pd.Series(pd.NaT, index=series.index)
@@ -105,13 +139,16 @@ def _parse_fecha(series: pd.Series) -> pd.Series:
     return result
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# NORMALIZACIÓN DE TEXTO (helpers locales, los completos están en matching_engine)
-# ═══════════════════════════════════════════════════════════════════════════════
+# =============================================================================
+# NORMALIZACION DE TEXTO
+# =============================================================================
 
 def _strip_accents(s: str) -> str:
-    return "".join(c for c in unicodedata.normalize("NFD", s)
-                   if unicodedata.category(c) != "Mn")
+    return "".join(
+        c for c in unicodedata.normalize("NFD", s)
+        if unicodedata.category(c) != "Mn"
+    )
+
 
 def _norm_title(s) -> str:
     if pd.isna(s) or str(s).strip() == "":
@@ -121,6 +158,7 @@ def _norm_title(s) -> str:
     t = re.sub(r"\s+", " ", t)
     return t.strip()
 
+
 def _slug_from_url(url_str) -> str:
     if not url_str or pd.isna(url_str):
         return ""
@@ -129,21 +167,21 @@ def _slug_from_url(url_str) -> str:
     return parts[-1].lower() if parts else ""
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# HELPERS — is_360radio / is_ia
-# ═══════════════════════════════════════════════════════════════════════════════
+# =============================================================================
+# HELPERS  is_360radio / is_ia
+# =============================================================================
 
 def _tags_contain_author(tags_str: str, author_str: str) -> bool:
     if not tags_str or not author_str or pd.isna(tags_str) or pd.isna(author_str):
         return False
     tags_norm = _strip_accents(str(tags_str).lower())
     tokens = [t.strip() for t in re.split(r"[\s,]+", str(author_str)) if len(t.strip()) > 3]
-    return any(tok in tags_norm for tok in [_strip_accents(t.lower()) for t in tokens])
+    return any(_strip_accents(t.lower()) in tags_norm for t in tokens)
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# LOADERS — GA4, Search Console, Producción, AdSense, MGID, AdManager, YouTube
-# ═══════════════════════════════════════════════════════════════════════════════
+# =============================================================================
+# LOADERS  —  GA4
+# =============================================================================
 
 @st.cache_data(ttl=3600)
 def load_ga4_general():
@@ -191,6 +229,11 @@ def load_ga4_interests():
             return _safe_numeric(df, "activeUsers", "sessions", "screenPageViews")
     return pd.DataFrame()
 
+
+# =============================================================================
+# LOADERS  —  Search Console, Produccion, AdSense, MGID, AdManager, YouTube
+# =============================================================================
+
 @st.cache_data(ttl=3600)
 def load_search_console():
     base   = "search_console_360radio.xlsx"
@@ -207,7 +250,6 @@ def load_search_console():
         result[k] = _to_dt(df, d) if not df.empty else pd.DataFrame()
     return result
 
-PRODUCCION_DESDE = pd.Timestamp("2025-01-01")
 
 @st.cache_data(ttl=3600)
 def load_produccion():
@@ -215,25 +257,35 @@ def load_produccion():
     if df.empty:
         return df
     df = _to_dt(_to_dt(df, "post_date"), "post_modified")
-    # Filtrar solo desde 2025-01-01 para reducir volumen de matching
+    # filtrar desde 2025-01-01
     if "post_date" in df.columns:
         df = df[df["post_date"] >= PRODUCCION_DESDE].copy().reset_index(drop=True)
-    if "post_id"    in df.columns: df["post_id"]      = pd.to_numeric(df["post_id"], errors="coerce")
-    if "post_title" in df.columns: df["_title_norm"]  = df["post_title"].apply(_norm_title)
-    if "url"        in df.columns:
-        df["_prod_slug"] = df["url"].apply(_slug_from_url)
-        df["_prod_path"] = df["url"].apply(lambda u: urlparse(str(u)).path.rstrip("/") if pd.notna(u) else "")
+    if "post_id"    in df.columns:
+        df["post_id"]     = pd.to_numeric(df["post_id"], errors="coerce")
+    if "post_title" in df.columns:
+        df["_title_norm"] = df["post_title"].apply(_norm_title)
+    if "url" in df.columns:
+        df["_prod_slug"]  = df["url"].apply(_slug_from_url)
+        df["_prod_path"]  = df["url"].apply(
+            lambda u: urlparse(str(u)).path.rstrip("/") if pd.notna(u) else "")
     return df
+
 
 @st.cache_data(ttl=3600)
 def load_adsense():
     df = _read_csv_robust("Adsense.csv")
-    return _to_dt(_safe_numeric(df, "Estimated earnings (USD)", "Impressions", "Clicks", "Impression RPM (USD)"), "Date")
+    return _to_dt(
+        _safe_numeric(df, "Estimated earnings (USD)", "Impressions", "Clicks", "Impression RPM (USD)"),
+        "Date"
+    )
 
 @st.cache_data(ttl=3600)
 def load_mgid():
     df = _read_csv_robust("MGID.csv")
-    return _to_dt(_safe_numeric(df, "Revenue", "Page views", "Ad Clicks", "Ad RPM", "Ad vRPM"), "Date")
+    return _to_dt(
+        _safe_numeric(df, "Revenue", "Page views", "Ad Clicks", "Ad RPM", "Ad vRPM"),
+        "Date"
+    )
 
 @st.cache_data(ttl=3600)
 def load_admanager():
@@ -249,27 +301,31 @@ def load_admanager():
 
 @st.cache_data(ttl=3600)
 def load_youtube():
-    base = "Youtube histórico.xlsx"
+    base = "Youtube historico.xlsx"
     return {
-        "tabla":   _safe_numeric(_read_excel(base, "Datos de la tabla"),
-                                 "Visualizaciones", "Impresiones", "Suscriptores", "Ingresos estimados (USD)"),
-        "grafico": _to_dt(_read_excel(base, "Datos del gráfico"), "Fecha"),
+        "tabla":   _safe_numeric(
+            _read_excel(base, "Datos de la tabla"),
+            "Visualizaciones", "Impresiones", "Suscriptores", "Ingresos estimados (USD)"
+        ),
+        "grafico": _to_dt(_read_excel(base, "Datos del grafico"), "Fecha"),
         "totales": _to_dt(_read_excel(base, "Totales"), "Fecha"),
     }
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# LOADERS REDES SOCIALES
-# ═══════════════════════════════════════════════════════════════════════════════
+# =============================================================================
+# LOADERS  —  Redes Sociales
+# =============================================================================
 
-def _load_social_base(fname: str, num_cols: list, id_col: str = "identificador de la publicación") -> pd.DataFrame:
+def _load_social_base(fname: str, num_cols: list,
+                      id_col: str = "identificador de la publicacion") -> pd.DataFrame:
     df = _read_csv_robust(fname)
     if df.empty:
         return df
-    for old in [id_col, "identificador de la publicación", "identificador"]:
+    for old in [id_col, "identificador de la publicacion", "identificador"]:
         if old in df.columns and old != "id_post":
-            df = df.rename(columns={old: "id_post"}); break
-    hora_col = "Hora de publicación"
+            df = df.rename(columns={old: "id_post"})
+            break
+    hora_col = "Hora de publicacion"
     if hora_col in df.columns:
         df["fecha_post"] = _parse_fecha(df[hora_col])
     else:
@@ -278,6 +334,7 @@ def _load_social_base(fname: str, num_cols: list, id_col: str = "identificador d
     df = _safe_numeric(df, *[c for c in num_cols if c in df.columns])
     return df.reset_index(drop=True)
 
+
 @st.cache_data(ttl=3600)
 def load_instagram_posts() -> pd.DataFrame:
     df = _load_social_base(
@@ -285,57 +342,66 @@ def load_instagram_posts() -> pd.DataFrame:
         ["Visualizaciones", "Alcance", "Me gusta", "Comentarios",
          "Veces que se ha compartido", "Veces guardado", "Seguidores"],
     )
-    if not df.empty and "Tipo de publicación" in df.columns:
-        df = df[df["Tipo de publicación"].str.strip() != "Historia de Instagram"].copy()
+    if not df.empty and "Tipo de publicacion" in df.columns:
+        df = df[df["Tipo de publicacion"].str.strip() != "Historia de Instagram"].copy()
     return df.reset_index(drop=True)
+
 
 @st.cache_data(ttl=3600)
 def load_instagram_stories() -> pd.DataFrame:
     return _load_social_base(
         "Instagram Historys.csv",
         ["Visualizaciones", "Alcance", "Me gusta", "Clics en el enlace",
-         "Respuestas", "Seguidores", "Navegación", "Toques en stickers",
+         "Respuestas", "Seguidores", "Navegacion", "Toques en stickers",
          "Visitas al perfil"],
     )
+
 
 @st.cache_data(ttl=3600)
 def load_facebook() -> pd.DataFrame:
     df = _load_social_base(
         "Post Facebook.csv",
-        ["Alcance", "Visualizaciones de vídeo de 3 segundos",
-         "Visualizaciones de vídeo de 1 minuto",
+        ["Alcance", "Visualizaciones de video de 3 segundos",
+         "Visualizaciones de video de 1 minuto",
          "Reacciones, comentarios y veces que se ha compartido",
          "Reacciones", "Comentarios", "Veces que se ha compartido",
          "Segundos reproducidos", "Segundos reproducidos de media",
          "Espectadores de 3 segundos", "Espectadores de 1 minuto"],
-        id_col="Identificador de la pieza de vídeo",
+        id_col="Identificador de la pieza de video",
     )
-    if not df.empty and "Identificador de la pieza de vídeo" in df.columns:
-        df = df.rename(columns={"Identificador de la pieza de vídeo": "id_post"})
+    if not df.empty and "Identificador de la pieza de video" in df.columns:
+        df = df.rename(columns={"Identificador de la pieza de video": "id_post"})
     return df.reset_index(drop=True)
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# MATCHING PRODUCCIÓN ↔ GA4  (usa el motor robusto de matching_engine.py)
-# ═══════════════════════════════════════════════════════════════════════════════
+# =============================================================================
+# MATCHING PRODUCCION  <->  GA4
+# Prod y GA4 URLs se leen en paralelo antes del matching.
+# =============================================================================
 
 @st.cache_data(ttl=3600)
 def load_produccion_con_metricas() -> pd.DataFrame:
-    prod = load_produccion()
-    urls = load_ga4_urls()
+    # lectura paralela: prod CSV + GA4 Excel al mismo tiempo
+    with ThreadPoolExecutor(max_workers=2) as ex:
+        f_prod = ex.submit(load_produccion)
+        f_urls = ex.submit(load_ga4_urls)
+        prod = f_prod.result()
+        urls = f_urls.result()
 
     if prod.empty:
         return prod
 
-    # ── Motor de matching robusto (12 pasos en cascada) ──
+    # matching en cascada (matching_engine.py)
     result = match_production_to_ga4(prod, urls)
 
-    # ── Flags is_ia / is_360radio ──
-    tags_col   = result["tags"]             if "tags"             in result.columns else pd.Series("", index=result.index)
-    author_col = result["post_author_name"] if "post_author_name" in result.columns else pd.Series("", index=result.index)
+    # flags is_ia / is_360radio
+    tags_col   = result["tags"]             if "tags"             in result.columns \
+                 else pd.Series("", index=result.index)
+    author_col = result["post_author_name"] if "post_author_name" in result.columns \
+                 else pd.Series("", index=result.index)
 
     result["is_ia"] = tags_col.apply(
-        lambda x: bool(re.search(r"s[ií]ntesis", str(x), re.I)))
+        lambda x: bool(re.search(r"s[ii]ntesis", str(x), re.I)))
 
     result["is_360radio"] = [
         _tags_contain_author(t, a)
@@ -345,9 +411,9 @@ def load_produccion_con_metricas() -> pd.DataFrame:
     return result
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
+# =============================================================================
 # UTILIDADES
-# ═══════════════════════════════════════════════════════════════════════════════
+# =============================================================================
 
 def filter_by_date(df: pd.DataFrame, date_col: str, start, end) -> pd.DataFrame:
     if df is None or df.empty or date_col not in df.columns:
@@ -357,40 +423,50 @@ def filter_by_date(df: pd.DataFrame, date_col: str, start, end) -> pd.DataFrame:
     ts_e = pd.Timestamp(end) + pd.Timedelta(hours=23, minutes=59, seconds=59)
     return df.loc[(col >= ts_s) & (col <= ts_e)].copy().reset_index(drop=True)
 
+
 def get_date_range(df: pd.DataFrame, col: str):
     from datetime import date as _d
     try:
         if df is None or df.empty or col not in df.columns:
-            return _d(2024,1,1), _d.today()
+            return _d(2024, 1, 1), _d.today()
         s = pd.to_datetime(df[col], errors="coerce").dropna()
-        return (s.min().date(), s.max().date()) if not s.empty else (_d(2024,1,1), _d.today())
+        return (s.min().date(), s.max().date()) if not s.empty else (_d(2024, 1, 1), _d.today())
     except Exception:
         from datetime import date as _d2
-        return _d2(2024,1,1), _d2.today()
+        return _d2(2024, 1, 1), _d2.today()
+
 
 def safe_sum(df, col) -> float:
     try:
-        if df is None or df.empty or col not in df.columns: return 0.0
+        if df is None or df.empty or col not in df.columns:
+            return 0.0
         return float(pd.to_numeric(df[col], errors="coerce").sum())
     except Exception:
         return 0.0
 
+
 def fmt_number(n) -> str:
     try:
-        if pd.isna(n): return "0"
+        if pd.isna(n):
+            return "0"
         n = int(n)
-        if n >= 1_000_000: return f"{n/1_000_000:.1f}M"
-        if n >= 1_000:     return f"{n/1_000:.1f}K"
+        if n >= 1_000_000:
+            return f"{n/1_000_000:.1f}M"
+        if n >= 1_000:
+            return f"{n/1_000:.1f}K"
         return str(n)
     except Exception:
         return "0"
 
+
 def pct_delta(cur, prev) -> "float | None":
     try:
-        if prev == 0 or pd.isna(prev) or pd.isna(cur): return None
+        if prev == 0 or pd.isna(prev) or pd.isna(cur):
+            return None
         return (cur - prev) / abs(prev) * 100
     except Exception:
         return None
+
 
 def _delta_str(cur, prev) -> "str | None":
     d = pct_delta(cur, prev)
