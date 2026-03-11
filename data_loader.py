@@ -207,12 +207,17 @@ def load_search_console():
         result[k] = _to_dt(df, d) if not df.empty else pd.DataFrame()
     return result
 
+PRODUCCION_DESDE = pd.Timestamp("2025-01-01")
+
 @st.cache_data(ttl=3600)
 def load_produccion():
     df = _read_csv_robust("Produccion.csv")
     if df.empty:
         return df
     df = _to_dt(_to_dt(df, "post_date"), "post_modified")
+    # Filtrar solo desde 2025-01-01 para reducir volumen de matching
+    if "post_date" in df.columns:
+        df = df[df["post_date"] >= PRODUCCION_DESDE].copy().reset_index(drop=True)
     if "post_id"    in df.columns: df["post_id"]      = pd.to_numeric(df["post_id"], errors="coerce")
     if "post_title" in df.columns: df["_title_norm"]  = df["post_title"].apply(_norm_title)
     if "url"        in df.columns:
