@@ -292,11 +292,19 @@ def load_produccion_con_metricas() -> pd.DataFrame:
 
 # ── UTILIDADES ────────────────────────────────────────────────────────────────
 def filter_by_date(df, date_col, start, end):
+    """
+    Filtra un DataFrame por rango de fechas.
+    Convierte start/end a pd.Timestamp para evitar TypeError en pandas >= 2.x
+    """
     if df is None or df.empty or date_col not in df.columns:
         return pd.DataFrame() if df is None else df
     df = df.copy()
     df[date_col] = pd.to_datetime(df[date_col], errors="coerce")
-    return df[(df[date_col].dt.date >= start) & (df[date_col].dt.date <= end)].reset_index(drop=True)
+    # Normalizar start/end a pd.Timestamp (evita TypeError con dt.date en pandas 2.x+)
+    ts_start = pd.Timestamp(start)
+    ts_end   = pd.Timestamp(end) + pd.Timedelta(days=1) - pd.Timedelta(seconds=1)
+    mask = (df[date_col] >= ts_start) & (df[date_col] <= ts_end)
+    return df[mask].reset_index(drop=True)
 
 def pct_delta(current, previous):
     if previous == 0 or pd.isna(previous) or pd.isna(current):
