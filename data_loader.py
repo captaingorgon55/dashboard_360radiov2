@@ -1,15 +1,22 @@
 """
-data_loader.py  –  360Radio Analytics v3.1
+data_loader.py  –  360Radio Analytics v4.0
 ==========================================
 SOCIAL MEDIA: Lee Post Instagram.csv / Instagram Historys.csv / Post Facebook.csv
 generados por merge_social_csvs.py. Admite múltiples formatos de fecha.
 
-MATCHING Produccion ↔ GA4 — 5 pasos en cascada:
-  1. post_id  == último número ≥4 dígitos en pagePath
-  2. post_id  == ?p=XXXXX  (legacy WP)
-  3. Título exacto normalizado
-  4. Slug del pagePath == slug de la URL de producción
-  5. Ratio de similitud ≥ 0.82 (Jaccard bigramas) vectorizado
+MATCHING Produccion ↔ GA4 — 12 pasos en cascada (ver matching_engine.py):
+  1.  post_id  == último número ≥4 dígitos en pagePath          (exacto)
+  2.  post_id  == ?p=XXXXX  (legacy WP)                         (exacto)
+  3.  Título exacto normalizado                                  (exacto)
+  4.  Path completo normalizado                                  (exacto)
+  5.  Slug final del pagePath == slug de URL de producción       (exacto)
+  6.  Slug sin stop-words                                        (exacto)
+  7.  Variantes de slug (guiones, plural/singular naive)         (heurístico)
+  8.  Token-set ratio ≥ 0.90 sobre títulos                       (fuzzy)
+  9.  Jaccard bigramas ≥ 0.82                                    (fuzzy)
+ 10.  Jaccard trigramas ≥ 0.78                                   (fuzzy)
+ 11.  LCS normalizado ≥ 0.85                                     (fuzzy)
+ 12.  TF-IDF coseno ≥ 0.80                                       (semántico)
 """
 import re, unicodedata
 import pandas as pd
@@ -17,6 +24,8 @@ import numpy as np
 import streamlit as st
 from pathlib import Path
 from urllib.parse import urlparse
+
+from matching_engine import match_production_to_ga4, match_stats  # noqa: F401
 
 DATA_DIR = Path("data")
 
@@ -82,8 +91,7 @@ _DATE_FORMATS = [
 ]
 
 def _parse_fecha(series: pd.Series) -> pd.Series:
-    """Intenta múltiples formatos y finaliza con pd.to_datetime genérico."""
-    result = pd.Series(pd.NaT, index=series.index)
+    result  = pd.Series(pd.NaT, index=series.index)
     pending = series.copy()
     for fmt in _DATE_FORMATS:
         mask = result.isna() & pending.notna()
@@ -91,7 +99,6 @@ def _parse_fecha(series: pd.Series) -> pd.Series:
             break
         parsed = pd.to_datetime(pending[mask], format=fmt, errors="coerce")
         result[mask] = parsed
-    # Último recurso
     still_na = result.isna() & pending.notna()
     if still_na.any():
         result[still_na] = pd.to_datetime(pending[still_na], errors="coerce")
@@ -99,7 +106,7 @@ def _parse_fecha(series: pd.Series) -> pd.Series:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# NORMALIZACIÓN DE TEXTO
+# NORMALIZACIÓN DE TEXTO (helpers locales, los completos están en matching_engine)
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def _strip_accents(s: str) -> str:
@@ -114,12 +121,6 @@ def _norm_title(s) -> str:
     t = re.sub(r"\s+", " ", t)
     return t.strip()
 
-def _slug_from_path(path_str) -> str:
-    if not path_str or pd.isna(path_str):
-        return ""
-    parts = [p for p in str(path_str).split("/") if p and not re.match(r"^\d+$", p)]
-    return parts[-1].lower() if parts else ""
-
 def _slug_from_url(url_str) -> str:
     if not url_str or pd.isna(url_str):
         return ""
@@ -127,59 +128,17 @@ def _slug_from_url(url_str) -> str:
     parts = [p for p in path.split("/") if p]
     return parts[-1].lower() if parts else ""
 
-def _post_id_from_path(path) -> "int | None":
-    if not path or pd.isna(path):
-        return None
-    s = str(path).strip()
-    m = re.search(r"/(\d{4,})/?(?:[?#].*)?$", s)
-    if m:
-        return int(m.group(1))
-    m2 = re.search(r"[?&]p=(\d+)", s)
-    return int(m2.group(1)) if m2 else None
-
-def _bigrams(s: str) -> set:
-    return set(s[i:i+2] for i in range(len(s)-1))
-
-def _similarity_ratio(a: str, b: str) -> float:
-    if not a or not b:
-        return 0.0
-    ba, bb = _bigrams(a), _bigrams(b)
-    if not ba or not bb:
-        return 0.0
-    return len(ba & bb) / len(ba | bb)
-
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# FUZZY MATCHING VECTORIZADO
+# HELPERS — is_360radio / is_ia
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def _fuzzy_match_vectorized(prod_titles, ga4_titles, ga4_values, threshold=0.82):
-    ga4_bg   = [_bigrams(t) for t in ga4_titles]
-    ga4_lens = np.array([len(t) for t in ga4_titles])
-    results  = []
-    for prod_t in prod_titles:
-        if not prod_t or len(prod_t) < 10:
-            results.append((0, 0, "sin_match")); continue
-        lo, hi = prod_t.__len__() * 0.5, prod_t.__len__() * 1.5
-        cands  = np.where((ga4_lens >= lo) & (ga4_lens <= hi))[0]
-        if not len(cands):
-            results.append((0, 0, "sin_match")); continue
-        prod_bg    = _bigrams(prod_t)
-        best_score = 0.0; best_idx = -1
-        for i in cands:
-            bg = ga4_bg[i]
-            if not bg: continue
-            inter = len(prod_bg & bg)
-            if not inter: continue
-            score = inter / len(prod_bg | bg)
-            if score > best_score:
-                best_score = score; best_idx = i
-        if best_score >= threshold and best_idx >= 0:
-            v, u = ga4_values[best_idx]
-            results.append((v, u, f"fuzzy_{best_score:.2f}"))
-        else:
-            results.append((0, 0, "sin_match"))
-    return results
+def _tags_contain_author(tags_str: str, author_str: str) -> bool:
+    if not tags_str or not author_str or pd.isna(tags_str) or pd.isna(author_str):
+        return False
+    tags_norm = _strip_accents(str(tags_str).lower())
+    tokens = [t.strip() for t in re.split(r"[\s,]+", str(author_str)) if len(t.strip()) > 3]
+    return any(tok in tags_norm for tok in [_strip_accents(t.lower()) for t in tokens])
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -242,9 +201,11 @@ def load_search_console():
         "country": ("🌎_GSC_Pais",    "date"),
         "device":  ("📱_GSC_Device",  "date"),
     }
-    return {k: _to_dt(_read_excel(base, s), d) if not (r := _read_excel(base, s)).empty
-            else pd.DataFrame()
-            for k, (s, d) in sheets.items()}
+    result = {}
+    for k, (s, d) in sheets.items():
+        df = _read_excel(base, s)
+        result[k] = _to_dt(df, d) if not df.empty else pd.DataFrame()
+    return result
 
 @st.cache_data(ttl=3600)
 def load_produccion():
@@ -293,19 +254,16 @@ def load_youtube():
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# LOADERS REDES SOCIALES  ← ACTUALIZADO: usa _parse_fecha multi-formato
+# LOADERS REDES SOCIALES
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def _load_social_base(fname: str, num_cols: list, id_col: str = "identificador de la publicación") -> pd.DataFrame:
-    """Base compartida para Instagram Posts, Stories y Facebook."""
     df = _read_csv_robust(fname)
     if df.empty:
         return df
-    # Renombrar id si viene con nombre largo
     for old in [id_col, "identificador de la publicación", "identificador"]:
         if old in df.columns and old != "id_post":
             df = df.rename(columns={old: "id_post"}); break
-    # Parsear fecha
     hora_col = "Hora de publicación"
     if hora_col in df.columns:
         df["fecha_post"] = _parse_fecha(df[hora_col])
@@ -315,7 +273,6 @@ def _load_social_base(fname: str, num_cols: list, id_col: str = "identificador d
     df = _safe_numeric(df, *[c for c in num_cols if c in df.columns])
     return df.reset_index(drop=True)
 
-
 @st.cache_data(ttl=3600)
 def load_instagram_posts() -> pd.DataFrame:
     df = _load_social_base(
@@ -323,11 +280,9 @@ def load_instagram_posts() -> pd.DataFrame:
         ["Visualizaciones", "Alcance", "Me gusta", "Comentarios",
          "Veces que se ha compartido", "Veces guardado", "Seguidores"],
     )
-    # Excluir stories si quedaron mezcladas (seguridad extra)
     if not df.empty and "Tipo de publicación" in df.columns:
         df = df[df["Tipo de publicación"].str.strip() != "Historia de Instagram"].copy()
     return df.reset_index(drop=True)
-
 
 @st.cache_data(ttl=3600)
 def load_instagram_stories() -> pd.DataFrame:
@@ -337,7 +292,6 @@ def load_instagram_stories() -> pd.DataFrame:
          "Respuestas", "Seguidores", "Navegación", "Toques en stickers",
          "Visitas al perfil"],
     )
-
 
 @st.cache_data(ttl=3600)
 def load_facebook() -> pd.DataFrame:
@@ -351,95 +305,38 @@ def load_facebook() -> pd.DataFrame:
          "Espectadores de 3 segundos", "Espectadores de 1 minuto"],
         id_col="Identificador de la pieza de vídeo",
     )
-    # Facebook no tiene "identificador de la publicación" → usar columna FB
     if not df.empty and "Identificador de la pieza de vídeo" in df.columns:
         df = df.rename(columns={"Identificador de la pieza de vídeo": "id_post"})
     return df.reset_index(drop=True)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# MATCHING PRODUCCIÓN ↔ GA4
+# MATCHING PRODUCCIÓN ↔ GA4  (usa el motor robusto de matching_engine.py)
 # ═══════════════════════════════════════════════════════════════════════════════
 
 @st.cache_data(ttl=3600)
 def load_produccion_con_metricas() -> pd.DataFrame:
     prod = load_produccion()
     urls = load_ga4_urls()
+
     if prod.empty:
         return prod
-    result = prod.copy()
-    result["ga4_views"]    = np.nan
-    result["ga4_users"]    = np.nan
-    result["match_method"] = "sin_match"
-    if urls.empty:
-        result[["ga4_views","ga4_users"]] = 0
-        result["is_ia"] = False
-        return result
 
-    urls_w = urls.copy()
-    if "pagePath" in urls_w.columns:
-        urls_w["_ga4_post_id"] = urls_w["pagePath"].apply(_post_id_from_path)
-        urls_w["_ga4_slug"]    = urls_w["pagePath"].apply(_slug_from_path)
-        urls_w["_ga4_clean"]   = urls_w["pagePath"].apply(lambda p: str(p).rstrip("/") if pd.notna(p) else "")
-    if "pageTitle" in urls_w.columns:
-        urls_w["_ga4_title"] = urls_w["pageTitle"].apply(_norm_title)
+    # ── Motor de matching robusto (12 pasos en cascada) ──
+    result = match_production_to_ga4(prod, urls)
 
-    def _agg(key_col, rename_to):
-        if key_col not in urls_w.columns: return pd.DataFrame()
-        sub = urls_w.dropna(subset=[key_col])
-        sub = sub[sub[key_col].astype(str) != ""]
-        if sub.empty: return pd.DataFrame()
-        kws = {}
-        if "screenPageViews" in sub.columns: kws["ga4_views"] = ("screenPageViews","sum")
-        if "activeUsers"     in sub.columns: kws["ga4_users"] = ("activeUsers","sum")
-        if not kws: return pd.DataFrame()
-        return sub.groupby(key_col, as_index=False).agg(**kws).rename(columns={key_col: rename_to})
+    # ── Flags is_ia / is_360radio ──
+    tags_col   = result["tags"]             if "tags"             in result.columns else pd.Series("", index=result.index)
+    author_col = result["post_author_name"] if "post_author_name" in result.columns else pd.Series("", index=result.index)
 
-    ga4_by_id    = _agg("_ga4_post_id", "_key_id")
-    ga4_by_title = _agg("_ga4_title",   "_key_title")
-    ga4_by_slug  = _agg("_ga4_slug",    "_key_slug")
-    ga4_by_path  = _agg("_ga4_clean",   "_key_path")
-    if not ga4_by_id.empty:
-        ga4_by_id["_key_id"] = pd.to_numeric(ga4_by_id["_key_id"], errors="coerce")
+    result["is_ia"] = tags_col.apply(
+        lambda x: bool(re.search(r"s[ií]ntesis", str(x), re.I)))
 
-    def _assign(merged_df, method_name):
-        no_match = result["match_method"] == "sin_match"
-        hit      = merged_df["ga4_views"].notna()
-        cond     = no_match & hit
-        if not cond.any(): return
-        result.loc[cond, "ga4_views"]    = merged_df.loc[cond, "ga4_views"].values
-        result.loc[cond, "ga4_users"]    = merged_df.loc[cond, "ga4_users"].fillna(0).values
-        result.loc[cond, "match_method"] = method_name
+    result["is_360radio"] = [
+        _tags_contain_author(t, a)
+        for t, a in zip(tags_col, author_col)
+    ]
 
-    if not ga4_by_id.empty    and "post_id"      in result.columns:
-        _assign(result[["post_id"]].merge(ga4_by_id, left_on="post_id", right_on="_key_id", how="left"), "post_id")
-    if not ga4_by_title.empty and "_title_norm"  in result.columns:
-        _assign(result[["_title_norm"]].merge(ga4_by_title, left_on="_title_norm", right_on="_key_title", how="left"), "titulo_exacto")
-    if not ga4_by_slug.empty  and "_prod_slug"   in result.columns:
-        _assign(result[["_prod_slug"]].merge(ga4_by_slug, left_on="_prod_slug", right_on="_key_slug", how="left"), "slug")
-    if not ga4_by_path.empty  and "_prod_path"   in result.columns:
-        _assign(result[["_prod_path"]].merge(ga4_by_path, left_on="_prod_path", right_on="_key_path", how="left"), "path_completo")
-
-    no_match_mask = result["match_method"] == "sin_match"
-    if no_match_mask.any() and not ga4_by_title.empty and "_title_norm" in result.columns:
-        ga4_titles_list = ga4_by_title["_key_title"].fillna("").tolist()
-        ga4_values_list = list(zip(
-            ga4_by_title["ga4_views"].fillna(0).tolist(),
-            ga4_by_title.get("ga4_users", pd.Series(0, index=ga4_by_title.index)).fillna(0).tolist()
-        ))
-        prod_no_match = result.loc[no_match_mask, "_title_norm"].tolist()
-        fuzzy_results = _fuzzy_match_vectorized(prod_no_match, ga4_titles_list, ga4_values_list)
-        idxs = result.index[no_match_mask]
-        for i, (v, u, method) in enumerate(fuzzy_results):
-            if method != "sin_match":
-                result.at[idxs[i], "ga4_views"]    = v
-                result.at[idxs[i], "ga4_users"]    = u
-                result.at[idxs[i], "match_method"] = method
-
-    result["ga4_views"] = result["ga4_views"].fillna(0).astype(int)
-    result["ga4_users"] = result["ga4_users"].fillna(0).astype(int)
-    tags_col = result["tags"] if "tags" in result.columns else pd.Series("", index=result.index)
-    result["is_ia"] = tags_col.apply(lambda x: bool(re.search(r"\bIA\b|\binteligencia[\s_-]?artificial\b", str(x), re.I)))
     return result
 
 
@@ -493,7 +390,3 @@ def pct_delta(cur, prev) -> "float | None":
 def _delta_str(cur, prev) -> "str | None":
     d = pct_delta(cur, prev)
     return f"{d:+.1f}%" if d is not None else None
-
-def match_stats(prod_df) -> dict:
-    if prod_df.empty or "match_method" not in prod_df.columns: return {}
-    return prod_df["match_method"].value_counts().to_dict()
