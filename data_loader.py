@@ -29,7 +29,7 @@ def _read_csv_robust(fname: str) -> pd.DataFrame:
     if not path.exists():
         return pd.DataFrame()
     for enc in ["utf-8", "utf-8-sig", "latin-1", "cp1252"]:
-        for sep in [",", ";", "\t", "|"]:
+        for sep in [",", ";", "\\t", "|"]:
             try:
                 df = pd.read_csv(path, encoding=enc, sep=sep, low_memory=False)
                 if len(df.columns) > 1:
@@ -74,16 +74,18 @@ def _safe_numeric(df: pd.DataFrame, *cols) -> pd.DataFrame:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 _DATE_FORMATS = [
+    "%b %d, %Y",           # ← YouTube Studio: "Feb 15, 2024"
     "%m/%d/%Y %H:%M",
     "%Y-%m-%d %H:%M:%S",
     "%Y-%m-%dT%H:%M:%S",
     "%d/%m/%Y %H:%M",
     "%Y-%m-%d",
+    "%b %d, %Y %H:%M",    # ← variante con hora
 ]
 
 def _parse_fecha(series: pd.Series) -> pd.Series:
     """Intenta múltiples formatos y finaliza con pd.to_datetime genérico."""
-    result = pd.Series(pd.NaT, index=series.index)
+    result  = pd.Series(pd.NaT, index=series.index)
     pending = series.copy()
     for fmt in _DATE_FORMATS:
         mask = result.isna() & pending.notna()
@@ -95,6 +97,40 @@ def _parse_fecha(series: pd.Series) -> pd.Series:
     still_na = result.isna() & pending.notna()
     if still_na.any():
         result[still_na] = pd.to_datetime(pending[still_na], errors="coerce")
+    return result
+
+
+def _parse_yt_pub_date(series: pd.Series) -> pd.Series:
+    """
+    Parsea 'Hora de publicación del vídeo' exportada por YouTube Studio.
+    Formatos conocidos:
+      - "Feb 15, 2024"
+      - "Feb 15, 2024, 10:30 AM"  (con hora)
+      - "2024-02-15"              (ISO, si viene de otra exportación)
+    Devuelve Series de datetime64 (NaT donde no parsea).
+    """
+    result  = pd.Series(pd.NaT, index=series.index)
+    pending = series.astype(str).str.strip()
+
+    for fmt in [
+        "%b %d, %Y",
+        "%b %d, %Y, %I:%M %p",
+        "%B %d, %Y",
+        "%B %d, %Y, %I:%M %p",
+        "%Y-%m-%d",
+        "%Y-%m-%d %H:%M:%S",
+    ]:
+        mask = result.isna() & (pending != "nan") & (pending != "")
+        if not mask.any():
+            break
+        parsed = pd.to_datetime(pending[mask], format=fmt, errors="coerce")
+        result[mask] = parsed
+
+    # Último recurso genérico
+    still_na = result.isna() & (pending != "nan") & (pending != "")
+    if still_na.any():
+        result[still_na] = pd.to_datetime(pending[still_na], errors="coerce", dayfirst=False)
+
     return result
 
 
@@ -110,14 +146,14 @@ def _norm_title(s) -> str:
     if pd.isna(s) or str(s).strip() == "":
         return ""
     t = _strip_accents(str(s).lower())
-    t = re.sub(r"[^\w\s]", " ", t)
-    t = re.sub(r"\s+", " ", t)
+    t = re.sub(r"[^\\w\\s]", " ", t)
+    t = re.sub(r"\\s+", " ", t)
     return t.strip()
 
 def _slug_from_path(path_str) -> str:
     if not path_str or pd.isna(path_str):
         return ""
-    parts = [p for p in str(path_str).split("/") if p and not re.match(r"^\d+$", p)]
+    parts = [p for p in str(path_str).split("/") if p and not re.match(r"^\\d+$", p)]
     return parts[-1].lower() if parts else ""
 
 def _slug_from_url(url_str) -> str:
@@ -131,10 +167,10 @@ def _post_id_from_path(path) -> "int | None":
     if not path or pd.isna(path):
         return None
     s = str(path).strip()
-    m = re.search(r"/(\d{4,})/?(?:[?#].*)?$", s)
+    m = re.search(r"/(\\d{4,})/?(?:[?#].*)?$", s)
     if m:
         return int(m.group(1))
-    m2 = re.search(r"[?&]p=(\d+)", s)
+    m2 = re.search(r"[?&]p=(\\d+)", s)
     return int(m2.group(1)) if m2 else None
 
 def _bigrams(s: str) -> set:
@@ -183,7 +219,7 @@ def _fuzzy_match_vectorized(prod_titles, ga4_titles, ga4_values, threshold=0.82)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# LOADERS — GA4, Search Console, Producción, AdSense, MGID, AdManager, YouTube
+# LOADERS
 # ═══════════════════════════════════════════════════════════════════════════════
 
 @st.cache_data(ttl=3600)
@@ -284,16 +320,45 @@ def load_admanager():
 @st.cache_data(ttl=3600)
 def load_youtube():
     base = "Youtube histórico.xlsx"
+
+    # ── Tabla de videos (sin fecha diaria) ────────────────────────────────────
+    tabla = _read_excel(base, "Datos de la tabla")
+    if not tabla.empty:
+        tabla = _safe_numeric(
+            tabla,
+            "Visualizaciones", "Impresiones", "Suscriptores",
+            "Ingresos estimados (USD)", "Tiempo de visualización (horas)",
+            "Porcentaje de clics de las impresiones (%)",
+        )
+        # ✅ Normalizar "Hora de publicación del vídeo" → datetime limpio
+        pub_col = "Hora de publicación del vídeo"
+        if pub_col in tabla.columns:
+            tabla[pub_col] = _parse_yt_pub_date(tabla[pub_col])
+
+    # ── Gráfico diario (tiene fecha) ──────────────────────────────────────────
+    grafico = _read_excel(base, "Datos del gráfico")
+    if not grafico.empty:
+        grafico = _to_dt(grafico, "Fecha")
+        grafico = _safe_numeric(
+            grafico,
+            "Visualizaciones", "Ingresos estimados (USD)",
+            "Impresiones", "Suscriptores",
+        )
+
+    # ── Totales ───────────────────────────────────────────────────────────────
+    totales = _read_excel(base, "Totales")
+    if not totales.empty:
+        totales = _to_dt(totales, "Fecha")
+
     return {
-        "tabla":   _safe_numeric(_read_excel(base, "Datos de la tabla"),
-                                 "Visualizaciones", "Impresiones", "Suscriptores", "Ingresos estimados (USD)"),
-        "grafico": _to_dt(_read_excel(base, "Datos del gráfico"), "Fecha"),
-        "totales": _to_dt(_read_excel(base, "Totales"), "Fecha"),
+        "tabla":   tabla   if not tabla.empty   else pd.DataFrame(),
+        "grafico": grafico if not grafico.empty else pd.DataFrame(),
+        "totales": totales if not totales.empty else pd.DataFrame(),
     }
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# LOADERS REDES SOCIALES  ← ACTUALIZADO: usa _parse_fecha multi-formato
+# LOADERS REDES SOCIALES
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def _load_social_base(fname: str, num_cols: list, id_col: str = "identificador de la publicación") -> pd.DataFrame:
@@ -301,11 +366,9 @@ def _load_social_base(fname: str, num_cols: list, id_col: str = "identificador d
     df = _read_csv_robust(fname)
     if df.empty:
         return df
-    # Renombrar id si viene con nombre largo
     for old in [id_col, "identificador de la publicación", "identificador"]:
         if old in df.columns and old != "id_post":
             df = df.rename(columns={old: "id_post"}); break
-    # Parsear fecha
     hora_col = "Hora de publicación"
     if hora_col in df.columns:
         df["fecha_post"] = _parse_fecha(df[hora_col])
@@ -323,7 +386,6 @@ def load_instagram_posts() -> pd.DataFrame:
         ["Visualizaciones", "Alcance", "Me gusta", "Comentarios",
          "Veces que se ha compartido", "Veces guardado", "Seguidores"],
     )
-    # Excluir stories si quedaron mezcladas (seguridad extra)
     if not df.empty and "Tipo de publicación" in df.columns:
         df = df[df["Tipo de publicación"].str.strip() != "Historia de Instagram"].copy()
     return df.reset_index(drop=True)
@@ -351,7 +413,6 @@ def load_facebook() -> pd.DataFrame:
          "Espectadores de 3 segundos", "Espectadores de 1 minuto"],
         id_col="Identificador de la pieza de vídeo",
     )
-    # Facebook no tiene "identificador de la publicación" → usar columna FB
     if not df.empty and "Identificador de la pieza de vídeo" in df.columns:
         df = df.rename(columns={"Identificador de la pieza de vídeo": "id_post"})
     return df.reset_index(drop=True)
@@ -411,13 +472,13 @@ def load_produccion_con_metricas() -> pd.DataFrame:
         result.loc[cond, "ga4_users"]    = merged_df.loc[cond, "ga4_users"].fillna(0).values
         result.loc[cond, "match_method"] = method_name
 
-    if not ga4_by_id.empty    and "post_id"      in result.columns:
+    if not ga4_by_id.empty    and "post_id"     in result.columns:
         _assign(result[["post_id"]].merge(ga4_by_id, left_on="post_id", right_on="_key_id", how="left"), "post_id")
-    if not ga4_by_title.empty and "_title_norm"  in result.columns:
+    if not ga4_by_title.empty and "_title_norm" in result.columns:
         _assign(result[["_title_norm"]].merge(ga4_by_title, left_on="_title_norm", right_on="_key_title", how="left"), "titulo_exacto")
-    if not ga4_by_slug.empty  and "_prod_slug"   in result.columns:
+    if not ga4_by_slug.empty  and "_prod_slug"  in result.columns:
         _assign(result[["_prod_slug"]].merge(ga4_by_slug, left_on="_prod_slug", right_on="_key_slug", how="left"), "slug")
-    if not ga4_by_path.empty  and "_prod_path"   in result.columns:
+    if not ga4_by_path.empty  and "_prod_path"  in result.columns:
         _assign(result[["_prod_path"]].merge(ga4_by_path, left_on="_prod_path", right_on="_key_path", how="left"), "path_completo")
 
     no_match_mask = result["match_method"] == "sin_match"
@@ -439,7 +500,7 @@ def load_produccion_con_metricas() -> pd.DataFrame:
     result["ga4_views"] = result["ga4_views"].fillna(0).astype(int)
     result["ga4_users"] = result["ga4_users"].fillna(0).astype(int)
     tags_col = result["tags"] if "tags" in result.columns else pd.Series("", index=result.index)
-    result["is_ia"] = tags_col.apply(lambda x: bool(re.search(r"\bIA\b|\binteligencia[\s_-]?artificial\b", str(x), re.I)))
+    result["is_ia"] = tags_col.apply(lambda x: bool(re.search(r"\\bIA\\b|\\binteligencia[\\s_-]?artificial\\b", str(x), re.I)))
     return result
 
 
