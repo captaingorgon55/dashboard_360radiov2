@@ -54,16 +54,7 @@ max_d = max(all_dates).date() if all_dates else date.today()
 sh("⚙️ Filtros")
 st.markdown('<div class="filter-box">', unsafe_allow_html=True)
 fc1,fc2,fc3 = st.columns(3)
-from datetime import date
-
-with c1:
-    start = st.date_input(
-        "📅 Desde",
-        date(2025, 1, 1),
-        min_value=min_d,
-        max_value=max_d,
-        key="gs"
-    )
+with c1: start = st.date_input("📅 Desde", max_d-timedelta(days=90), min_value=min_d, max_value=max_d, key="gs")
 with fc2: end   = st.date_input("📅 Hasta", max_d, min_value=min_d, max_value=max_d, key="ads_e")
 with fc3:
     plataformas = st.multiselect("💳 Plataforma",
