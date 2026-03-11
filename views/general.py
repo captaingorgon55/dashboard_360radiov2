@@ -89,7 +89,16 @@ sh("⚙️ Filtros")
 st.markdown('<div class="filter-box">', unsafe_allow_html=True)
 c1,c2,c3,c4,c5,c6 = st.columns(6)
 
-with c1: start = st.date_input("📅 Desde", max_d-timedelta(days=90), min_value=min_d, max_value=max_d, key="gs")
+from datetime import date
+
+with c1:
+    start = st.date_input(
+        "📅 Desde",
+        date(2025, 1, 1),
+        min_value=min_d,
+        max_value=max_d,
+        key="gs"
+    )
 with c2: end   = st.date_input("📅 Hasta", max_d, min_value=min_d, max_value=max_d, key="ge")
 with c3: sel_aut  = st.selectbox("✍️ Autor",   auth_list, key="ga")
 with c4:
