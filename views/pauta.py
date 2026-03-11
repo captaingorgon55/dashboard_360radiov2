@@ -41,16 +41,8 @@ min_d, max_d = get_date_range(diario, "DATE")
 # ── FILTROS ───────────────────────────────────────────────────────────────────
 sh("⚙️ Filtros")
 st.markdown('<div class="filter-box">', unsafe_allow_html=True)
-fc1,fc2,fc3,fc4 = st.columns(4)from datetime import date
-
-with c1:
-    start = st.date_input(
-        "📅 Desde",
-        date(2025, 1, 1),
-        min_value=min_d,
-        max_value=max_d,
-        key="gs"
-    )
+fc1,fc2,fc3,fc4 = st.columns(4)
+with c1: start = st.date_input("📅 Desde", max_d-timedelta(days=90), min_value=min_d, max_value=max_d, key="gs")
 with fc2: end   = st.date_input("📅 Hasta", max_d, min_value=min_d, max_value=max_d, key="pau_e")
 
 camp_opts = ["Todas"]
