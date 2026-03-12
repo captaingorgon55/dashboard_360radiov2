@@ -374,16 +374,18 @@ def load_youtube():
     fecha_col = "Hora de publicación del vídeo"
     if fecha_col in df.columns:
         raw = df[fecha_col].astype(str).str.strip()
-        # normalizar espacios antes de la coma: "Mar 13 , 2026" -> "Mar 13, 2026"
         raw = raw.str.replace(r"\s*,\s*", ", ", regex=True)
-        df[fecha_col] = pd.to_datetime(raw, format="%b %d, %Y", errors="coerce")
-        # fallback para otras variantes
-        mask = df[fecha_col].isna()
+        parsed = pd.to_datetime(raw, format="%b %d, %Y", errors="coerce")
+        # fallback
+        mask = parsed.isna()
         if mask.any():
-            df.loc[mask, fecha_col] = pd.to_datetime(
-                raw[mask], errors="coerce", dayfirst=False
-            )
-    return {"tabla": df, "grafico": pd.DataFrame(), "totales": pd.DataFrame()}
+            parsed[mask] = pd.to_datetime(raw[mask], errors="coerce", dayfirst=False)
+        df[fecha_col] = parsed
+        # alias "Fecha" para que la vista lo encuentre igual que otros datasets
+        df["Fecha"] = parsed
+
+    # "grafico" apunta al mismo df para que la vista pueda filtrar por fecha
+    return {"tabla": df, "grafico": df, "totales": pd.DataFrame()}
 
 
 # =============================================================================
