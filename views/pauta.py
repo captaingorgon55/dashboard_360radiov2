@@ -5,7 +5,6 @@ import numpy as np
 import plotly.express as px
 import plotly.graph_objects as go
 from datetime import date, timedelta
-from pathlib import Path
 from data_loader import load_admanager, filter_by_date, fmt_number, safe_sum, get_date_range, pct_delta
 
 C   = ["#6366f1","#06b6d4","#10b981","#f59e0b","#ef4444","#8b5cf6"]
@@ -27,9 +26,9 @@ def _delta(cur, prev):
     return f"{d:+.1f}%" if d is not None else None
 
 st.markdown('<div class="page-title">📣 Pauta</div>', unsafe_allow_html=True)
-st.markdown('<div class="page-subtitle">Campañas · Orders · Line Items · Fill Rate · Ad Manager · Viads</div>', unsafe_allow_html=True)
+st.markdown('<div class="page-subtitle">Campañas · Orders · Line Items · Fill Rate · Ad Manager</div>', unsafe_allow_html=True)
 
-# ── Carga Ad Manager ──────────────────────────────────────────────────────────
+# ── Carga ─────────────────────────────────────────────────────────────────────
 gam    = load_admanager()
 diario = gam["diario"]
 orders = gam["orders"]
@@ -49,6 +48,7 @@ if not orders.empty and "ORDER_NAME" in orders.columns:
     camp_opts += sorted(orders["ORDER_NAME"].dropna().unique().tolist())
 with fc3: sel_camp = st.selectbox("📢 Campaña", camp_opts, key="pau_camp")
 
+# Opciones de Ad Unit: combinar fill + diario para mayor cobertura
 unit_opts = ["Todas"]
 all_units = set()
 if not fill.empty and "AD_UNIT_NAME" in fill.columns:
@@ -65,11 +65,13 @@ fill_f   = filter_by_date(fill,   "DATE", start, end)
 pd_      = (end - start).days or 1
 diario_p = filter_by_date(diario, "DATE", start - timedelta(days=pd_), start - timedelta(days=1))
 
-# ── Filtro Ad Unit ────────────────────────────────────────────────────────────
+# ── Filtro Ad Unit → diario_f, diario_p, fill_f ───────────────────────────────
 diario_tiene_unit = "AD_UNIT_NAME" in diario.columns
 if sel_unit != "Todas":
+    # fill_f siempre se puede filtrar por unit
     if not fill_f.empty and "AD_UNIT_NAME" in fill_f.columns:
         fill_f = fill_f[fill_f["AD_UNIT_NAME"] == sel_unit]
+    # diario_f y diario_p solo si tienen la columna
     if diario_tiene_unit:
         if not diario_f.empty:
             diario_f = diario_f[diario_f["AD_UNIT_NAME"] == sel_unit]
@@ -83,17 +85,20 @@ if sel_unit != "Todas":
             icon="⚠️"
         )
 
-# ── Filtro Campaña ────────────────────────────────────────────────────────────
+# ── Filtro Campaña → orders_f ─────────────────────────────────────────────────
 orders_f = orders.copy() if not orders.empty else pd.DataFrame()
 if sel_camp != "Todas" and not orders_f.empty and "ORDER_NAME" in orders_f.columns:
     orders_f = orders_f[orders_f["ORDER_NAME"] == sel_camp]
 
+# ── Captions de filtros activos ───────────────────────────────────────────────
 if sel_camp != "Todas":
     st.caption(f"📢 Filtrando por campaña: **{sel_camp}**")
 if sel_unit != "Todas":
     st.caption(f"📦 Ad Unit: **{sel_unit}**")
 
-# ── Métricas ──────────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+# MÉTRICAS: si hay filtro de campaña → desde orders_f; si no → desde diario_f
+# ══════════════════════════════════════════════════════════════════════════════
 has_camp = sel_camp != "Todas" and not orders_f.empty
 
 def _si(df, col): return int(safe_sum(df, col))
@@ -103,7 +108,7 @@ if has_camp:
     impr   = _si(orders_f, "AD_SERVER_IMPRESSIONS")
     clicks = _si(orders_f, "AD_SERVER_CLICKS")
     rev    = _sf(orders_f, "AD_SERVER_CPM_AND_CPC_REVENUE")
-    fill_i = impr
+    fill_i = impr  # aproximado desde orders
     ctr    = orders_f["AD_SERVER_CTR"].mean() * 100 if not orders_f.empty and "AD_SERVER_CTR" in orders_f.columns else 0
     impr_p = clicks_p = rev_p = fill_i_p = 0
 else:
@@ -117,7 +122,8 @@ else:
     clicks_p = _si(diario_p, "AD_SERVER_CLICKS")
     rev_p    = _sf(diario_p, "AD_SERVER_CPM_AND_CPC_REVENUE")
 
-sh("📊 Métricas del Período · Ad Manager")
+# ── MÉTRICAS ──────────────────────────────────────────────────────────────────
+sh("📊 Métricas del Período")
 m1, m2, m3, m4, m5 = st.columns(5)
 m1.metric("📢 Impresiones",      fmt_number(impr),   _delta(impr, impr_p)     if not has_camp else None)
 m2.metric("🎯 Total Line Items", fmt_number(fill_i), _delta(fill_i, fill_i_p) if not has_camp else None)
@@ -128,6 +134,8 @@ m5.metric("📈 CTR",              f"{ctr:.2f}%")
 # ── G1: Evolución mensual ─────────────────────────────────────────────────────
 sh("📈 Evolución Mensual · Impresiones y Revenue")
 
+# Si hay filtro de Ad Unit y diario no tiene esa columna,
+# intentar usar fill_f como fuente alternativa para el gráfico
 if sel_unit != "Todas" and not diario_tiene_unit and not fill_f.empty and "AD_SERVER_IMPRESSIONS" in fill_f.columns:
     src_evol = fill_f.rename(columns={"DATE": "DATE"})
     st.caption("ℹ️ Gráfico usando GAM_Fill_Rate como fuente (filtrado por Ad Unit).")
@@ -184,6 +192,7 @@ if not orders_f.empty:
     if "Revenue"     in ord_s.columns: nf["Revenue"]     = "${:,.2f}"
     if "eCPM"        in ord_s.columns: nf["eCPM"]        = "${:,.2f}"
 
+    # Gráfico impresiones por campaña
     if "Campaña" in ord_s.columns and "Impresiones" in ord_s.columns:
         ca = ord_s.groupby("Campaña")["Impresiones"].sum().reset_index()\
                   .sort_values("Impresiones", ascending=False).head(15)
@@ -194,6 +203,7 @@ if not orders_f.empty:
         _fig(f2, max(280, len(ca) * 30 + 60))
         st.plotly_chart(f2, use_container_width=True)
 
+    # Gráfico Revenue + Clicks por campaña
     if "Campaña" in ord_s.columns and len(orders_f) > 1:
         grp = {}
         if "Impresiones" in ord_s.columns: grp["Impresiones"] = "sum"
@@ -218,6 +228,7 @@ if not orders_f.empty:
             _fig(f3, 420)
             st.plotly_chart(f3, use_container_width=True)
 
+    # Tabla detalle
     sh("📄 Detalle de Line Items")
     srch = st.text_input("🔎 Buscar campaña o line item...", key="li_srch")
     od = ord_s.copy()
@@ -248,6 +259,7 @@ if not fill_f.empty and "FILL_RATE_%" in fill_f.columns and "DATE" in fill_f.col
     _fig(ff, 280)
     st.plotly_chart(ff, use_container_width=True)
 
+    # Tabla fill rate por ad unit
     if "AD_UNIT_NAME" in fill_f.columns:
         sh("📦 Fill Rate por Unidad de Anuncio")
         agg_dict = {"Fill_Rate_Prom": ("FILL_RATE_%", "mean")}
@@ -269,7 +281,7 @@ else:
 # ── G4: Mensual acumulado ─────────────────────────────────────────────────────
 gam_men = gam["mensual"]
 if not gam_men.empty and "YEAR_MONTH" in gam_men.columns:
-    sh("📅 Resumen Mensual Acumulado · Ad Manager")
+    sh("📅 Resumen Mensual Acumulado")
     cm2 = {
         "YEAR_MONTH": "Mes", "AD_SERVER_IMPRESSIONS": "Impresiones",
         "AD_SERVER_CLICKS": "Clicks", "AD_SERVER_CPM_AND_CPC_REVENUE": "Revenue",
@@ -283,195 +295,3 @@ if not gam_men.empty and "YEAR_MONTH" in gam_men.columns:
     if "Fill Rate %" in gm_s.columns: nf4["Fill Rate %"] = "{:.1f}%"
     if "eCPM"        in gm_s.columns: nf4["eCPM"]        = "${:,.2f}"
     st.dataframe(gm_s.style.format(nf4), use_container_width=True, hide_index=True)
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# SECCIÓN VIADS
-# ══════════════════════════════════════════════════════════════════════════════
-
-st.markdown("---")
-
-# ── Loader Viads ──────────────────────────────────────────────────────────────
-@st.cache_data(ttl=3600)
-def _load_viads() -> pd.DataFrame:
-    """
-    Busca el CSV de Viads en varias rutas dentro de data/.
-    Separador ';', fechas DD.MM.YYYY.
-    """
-    data_dir = Path("data")
-    candidates = [
-        data_dir / "statistics_2025-01-01_2026-04-01.csv",
-        data_dir / "viads.csv",
-        data_dir / "Viads.csv",
-    ]
-    if data_dir.exists():
-        candidates += sorted(data_dir.glob("statistics_*.csv"))
-
-    df = pd.DataFrame()
-    for path in candidates:
-        if path.exists():
-            try:
-                tmp = pd.read_csv(path, sep=";", low_memory=False)
-                if len(tmp.columns) > 1:
-                    df = tmp
-                    break
-            except Exception:
-                continue
-
-    if df.empty:
-        return df
-
-    if "Date" in df.columns:
-        df["Date"] = pd.to_datetime(df["Date"], format="%d.%m.%Y", errors="coerce")
-        df = df[df["Date"].notna()].copy()
-        df = df.sort_values("Date").reset_index(drop=True)
-
-    for col in ["Impressions", "Clicks", "CTR", "CPM", "Income"]:
-        if col in df.columns:
-            df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0)
-
-    return df
-
-
-def _filter_viads(df: pd.DataFrame, s, e) -> pd.DataFrame:
-    if df.empty or "Date" not in df.columns:
-        return df
-    ts_s = pd.Timestamp(s)
-    ts_e = pd.Timestamp(e) + pd.Timedelta(hours=23, minutes=59, seconds=59)
-    return df[(df["Date"] >= ts_s) & (df["Date"] <= ts_e)].copy().reset_index(drop=True)
-
-
-st.markdown('<div class="page-title" style="font-size:1.2rem;margin-top:.5rem">📺 Viads</div>', unsafe_allow_html=True)
-st.markdown('<div class="page-subtitle">Estadísticas diarias · Impressions · Clicks · CTR · CPM · Income</div>', unsafe_allow_html=True)
-
-viads_raw = _load_viads()
-
-if viads_raw.empty:
-    st.warning(
-        "⚠️ No se encontró el archivo de Viads. "
-        "Coloca el CSV en **data/statistics_2025-01-01_2026-04-01.csv** (o renómbralo **data/viads.csv**)."
-    )
-else:
-    v_min = viads_raw["Date"].min().date()
-    v_max = viads_raw["Date"].max().date()
-
-    # Filtros propios de Viads (reutiliza el rango de Ad Manager para coherencia)
-    sh("⚙️ Filtros · Viads")
-    st.markdown('<div class="filter-box">', unsafe_allow_html=True)
-    vc1, vc2 = st.columns(2)
-    with vc1:
-        v_start = st.date_input("📅 Desde", v_min, min_value=v_min, max_value=v_max, key="viads_s")
-    with vc2:
-        v_end = st.date_input("📅 Hasta", v_max, min_value=v_min, max_value=v_max, key="viads_e")
-    st.markdown('</div>', unsafe_allow_html=True)
-
-    vdf  = _filter_viads(viads_raw, v_start, v_end)
-    vp_  = (v_end - v_start).days or 1
-    vdf_p = _filter_viads(viads_raw, v_start - timedelta(days=vp_), v_start - timedelta(days=1))
-
-    if vdf.empty:
-        st.info("Sin datos de Viads para el período seleccionado.")
-    else:
-        # ── Métricas ──────────────────────────────────────────────────────────
-        sh("📊 Métricas del Período · Viads")
-
-        v_imp  = vdf["Impressions"].sum()
-        v_clk  = vdf["Clicks"].sum()
-        v_inc  = vdf["Income"].sum()
-        v_cpm  = vdf.loc[vdf["CPM"] > 0, "CPM"].mean() if (vdf["CPM"] > 0).any() else 0
-        v_ctr  = vdf["CTR"].mean() * 100 if vdf["CTR"].max() <= 1 else vdf["CTR"].mean()
-
-        vi_p   = vdf_p["Impressions"].sum() if not vdf_p.empty else 0
-        vc_p   = vdf_p["Clicks"].sum()      if not vdf_p.empty else 0
-        vinc_p = vdf_p["Income"].sum()       if not vdf_p.empty else 0
-
-        vm1, vm2, vm3, vm4, vm5 = st.columns(5)
-        vm1.metric("📢 Impressions", fmt_number(v_imp),      _delta(v_imp, vi_p))
-        vm2.metric("🖱️ Clicks",      fmt_number(v_clk),      _delta(v_clk, vc_p))
-        vm3.metric("💵 Income",      f"${v_inc:,.2f}",        _delta(v_inc, vinc_p))
-        vm4.metric("💰 CPM Prom.",   f"${v_cpm:,.2f}")
-        vm5.metric("🎯 CTR Prom.",   f"{v_ctr:.2f}%")
-
-        # ── G5: Impressions + Income diario ───────────────────────────────────
-        sh("📈 Evolución Diaria · Impressions e Income")
-
-        fg1 = go.Figure()
-        fg1.add_trace(go.Bar(
-            x=vdf["Date"], y=vdf["Impressions"],
-            name="Impressions", marker_color=C[0], opacity=0.75,
-        ))
-        fg1.add_trace(go.Scatter(
-            x=vdf["Date"], y=vdf["Income"],
-            name="Income (USD)", mode="lines+markers",
-            line=dict(color=C[3], width=2.5),
-            marker=dict(size=7, color=C[3], line=dict(color="#fff", width=1.5)),
-            yaxis="y2",
-        ))
-        fg1.update_layout(
-            barmode="overlay",
-            yaxis2=dict(overlaying="y", side="right", showgrid=False,
-                        tickprefix="$", tickfont=dict(color=C[3])),
-            legend=dict(orientation="h", y=1.12),
-        )
-        _fig(fg1, 340)
-        st.plotly_chart(fg1, use_container_width=True)
-
-        # ── G6: CPM diario ────────────────────────────────────────────────────
-        df_cpm = vdf[vdf["CPM"] > 0].copy()
-        if not df_cpm.empty:
-            sh("💰 CPM Diario")
-            avg_cpm_v = df_cpm["CPM"].mean()
-            fg2 = px.line(df_cpm, x="Date", y="CPM", markers=True,
-                          color_discrete_sequence=[C[2]])
-            fg2.update_traces(line_width=2.5, marker_size=8,
-                              marker=dict(color=C[2], line=dict(color="#fff", width=1.5)))
-            fg2.add_hline(y=avg_cpm_v, line_dash="dot", line_color=C[3],
-                annotation_text=f"Prom: ${avg_cpm_v:.2f}",
-                annotation_font_color=C[3], annotation_font_size=11)
-            fg2.update_layout(yaxis_title="CPM (USD)", yaxis_tickprefix="$")
-            _fig(fg2, 260)
-            st.plotly_chart(fg2, use_container_width=True)
-
-        # ── G7: CTR diario ────────────────────────────────────────────────────
-        df_ctr = vdf[vdf["CTR"] > 0].copy()
-        if not df_ctr.empty:
-            sh("🎯 CTR Diario")
-            df_ctr["CTR_pct"] = df_ctr["CTR"] * 100 if df_ctr["CTR"].max() <= 1 else df_ctr["CTR"]
-            fg3 = px.bar(df_ctr, x="Date", y="CTR_pct",
-                         color_discrete_sequence=[C[5]],
-                         labels={"CTR_pct": "CTR (%)"})
-            fg3.update_layout(yaxis_ticksuffix="%", yaxis_title="CTR (%)")
-            _fig(fg3, 240)
-            st.plotly_chart(fg3, use_container_width=True)
-
-        # ── Tabla detalle ─────────────────────────────────────────────────────
-        sh("📄 Detalle Diario · Viads")
-        vdisp = vdf.copy()
-        vdisp["Date"] = vdisp["Date"].dt.strftime("%d/%m/%Y")
-        vdisp = vdisp.sort_values("Date", ascending=False)
-        nfv = {
-            "Impressions": "{:,.0f}",
-            "Clicks":      "{:,.0f}",
-            "CTR":         "{:.3f}",
-            "CPM":         "${:,.2f}",
-            "Income":      "${:,.3f}",
-        }
-        st.dataframe(vdisp.style.format(nfv), use_container_width=True, hide_index=True, height=400)
-
-        # ── Resumen mensual Viads ─────────────────────────────────────────────
-        sh("📅 Resumen Mensual · Viads")
-        vmes = vdf.copy()
-        vmes["Mes"] = vmes["Date"].dt.to_period("M").astype(str)
-        monthly_v = vmes.groupby("Mes").agg(
-            Impressions=("Impressions", "sum"),
-            Clicks     =("Clicks",      "sum"),
-            Income     =("Income",      "sum"),
-            CPM_Prom   =("CPM",         lambda x: x[x > 0].mean() if (x > 0).any() else 0),
-        ).reset_index()
-        nfm = {
-            "Impressions": "{:,.0f}",
-            "Clicks":      "{:,.0f}",
-            "Income":      "${:,.3f}",
-            "CPM_Prom":    "${:,.2f}",
-        }
-        st.dataframe(monthly_v.style.format(nfm), use_container_width=True, hide_index=True)
