@@ -1,5 +1,5 @@
 """
-data_loader.py  –  360Radio Analytics v3.1
+data_loader.py  –  360Radio Analytics v3.2
 ==========================================
 SOCIAL MEDIA: Lee Post Instagram.csv / Instagram Historys.csv / Post Facebook.csv
 generados por merge_social_csvs.py. Admite múltiples formatos de fecha.
@@ -10,6 +10,11 @@ MATCHING Produccion ↔ GA4 — 5 pasos en cascada:
   3. Título exacto normalizado
   4. Slug del pagePath == slug de la URL de producción
   5. Ratio de similitud ≥ 0.82 (Jaccard bigramas) vectorizado
+
+DEDUPLICACIÓN (v3.2):
+  - load_produccion()              → deduplica por post_id antes de retornar
+  - load_produccion_con_metricas() → colapsa urls_w por pagePath antes del matching
+  - Todas las tablas de UI         → usan prod deduplicado desde la raíz
 """
 import re, unicodedata
 import pandas as pd
@@ -74,17 +79,16 @@ def _safe_numeric(df: pd.DataFrame, *cols) -> pd.DataFrame:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 _DATE_FORMATS = [
-    "%b %d, %Y",           # ← YouTube Studio: "Feb 15, 2024"
+    "%b %d, %Y",
     "%m/%d/%Y %H:%M",
     "%Y-%m-%d %H:%M:%S",
     "%Y-%m-%dT%H:%M:%S",
     "%d/%m/%Y %H:%M",
     "%Y-%m-%d",
-    "%b %d, %Y %H:%M",    # ← variante con hora
+    "%b %d, %Y %H:%M",
 ]
 
 def _parse_fecha(series: pd.Series) -> pd.Series:
-    """Intenta múltiples formatos y finaliza con pd.to_datetime genérico."""
     result  = pd.Series(pd.NaT, index=series.index)
     pending = series.copy()
     for fmt in _DATE_FORMATS:
@@ -93,7 +97,6 @@ def _parse_fecha(series: pd.Series) -> pd.Series:
             break
         parsed = pd.to_datetime(pending[mask], format=fmt, errors="coerce")
         result[mask] = parsed
-    # Último recurso
     still_na = result.isna() & pending.notna()
     if still_na.any():
         result[still_na] = pd.to_datetime(pending[still_na], errors="coerce")
@@ -101,17 +104,8 @@ def _parse_fecha(series: pd.Series) -> pd.Series:
 
 
 def _parse_yt_pub_date(series: pd.Series) -> pd.Series:
-    """
-    Parsea 'Hora de publicación del vídeo' exportada por YouTube Studio.
-    Formatos conocidos:
-      - "Feb 15, 2024"
-      - "Feb 15, 2024, 10:30 AM"  (con hora)
-      - "2024-02-15"              (ISO, si viene de otra exportación)
-    Devuelve Series de datetime64 (NaT donde no parsea).
-    """
     result  = pd.Series(pd.NaT, index=series.index)
     pending = series.astype(str).str.strip()
-
     for fmt in [
         "%b %d, %Y",
         "%b %d, %Y, %I:%M %p",
@@ -125,12 +119,9 @@ def _parse_yt_pub_date(series: pd.Series) -> pd.Series:
             break
         parsed = pd.to_datetime(pending[mask], format=fmt, errors="coerce")
         result[mask] = parsed
-
-    # Último recurso genérico
     still_na = result.isna() & (pending != "nan") & (pending != "")
     if still_na.any():
         result[still_na] = pd.to_datetime(pending[still_na], errors="coerce", dayfirst=False)
-
     return result
 
 
@@ -146,14 +137,14 @@ def _norm_title(s) -> str:
     if pd.isna(s) or str(s).strip() == "":
         return ""
     t = _strip_accents(str(s).lower())
-    t = re.sub(r"[^\\w\\s]", " ", t)
-    t = re.sub(r"\\s+", " ", t)
+    t = re.sub(r"[^\w\s]", " ", t)
+    t = re.sub(r"\s+", " ", t)
     return t.strip()
 
 def _slug_from_path(path_str) -> str:
     if not path_str or pd.isna(path_str):
         return ""
-    parts = [p for p in str(path_str).split("/") if p and not re.match(r"^\\d+$", p)]
+    parts = [p for p in str(path_str).split("/") if p and not re.match(r"^\d+$", p)]
     return parts[-1].lower() if parts else ""
 
 def _slug_from_url(url_str) -> str:
@@ -167,10 +158,10 @@ def _post_id_from_path(path) -> "int | None":
     if not path or pd.isna(path):
         return None
     s = str(path).strip()
-    m = re.search(r"/(\\d{4,})/?(?:[?#].*)?$", s)
+    m = re.search(r"/(\d{4,})/?(?:[?#].*)?$", s)
     if m:
         return int(m.group(1))
-    m2 = re.search(r"[?&]p=(\\d+)", s)
+    m2 = re.search(r"[?&]p=(\d+)", s)
     return int(m2.group(1)) if m2 else None
 
 def _bigrams(s: str) -> set:
@@ -288,12 +279,25 @@ def load_produccion():
     if df.empty:
         return df
     df = _to_dt(_to_dt(df, "post_date"), "post_modified")
-    if "post_id"    in df.columns: df["post_id"]      = pd.to_numeric(df["post_id"], errors="coerce")
-    if "post_title" in df.columns: df["_title_norm"]  = df["post_title"].apply(_norm_title)
-    if "url"        in df.columns:
+    if "post_id" in df.columns:
+        df["post_id"] = pd.to_numeric(df["post_id"], errors="coerce")
+    if "post_title" in df.columns:
+        df["_title_norm"] = df["post_title"].apply(_norm_title)
+    if "url" in df.columns:
         df["_prod_slug"] = df["url"].apply(_slug_from_url)
-        df["_prod_path"] = df["url"].apply(lambda u: urlparse(str(u)).path.rstrip("/") if pd.notna(u) else "")
-    return df
+        df["_prod_path"] = df["url"].apply(
+            lambda u: urlparse(str(u)).path.rstrip("/") if pd.notna(u) else ""
+        )
+
+    # ── DEDUPLICACIÓN: una fila por nota ──────────────────────────────────────
+    # Posts con múltiples categorías pueden exportarse como filas repetidas.
+    # Conservamos la primera aparición para no inflar métricas.
+    if "post_id" in df.columns:
+        df = df.drop_duplicates(subset=["post_id"], keep="first")
+    elif "url" in df.columns:
+        df = df.drop_duplicates(subset=["url"], keep="first")
+
+    return df.reset_index(drop=True)
 
 @st.cache_data(ttl=3600)
 def load_adsense():
@@ -319,11 +323,10 @@ def load_admanager():
 
 @st.cache_data(ttl=3600)
 def load_youtube():
-    base = "Youtube historico.xlsx"  # nombre sin tilde para compatibilidad de filesystem
+    base = "Youtube historico.xlsx"
 
-    # ── Tabla de videos: revenue + métricas por video (sin fecha diaria) ──────
     tabla = _read_excel(base, "Datos de la tabla")
-    if tabla.empty:  # fallback con tilde
+    if tabla.empty:
         tabla = _read_excel("Youtube histórico.xlsx", "Datos de la tabla")
     if not tabla.empty:
         tabla = _safe_numeric(
@@ -342,19 +345,16 @@ def load_youtube():
             df = _read_excel("Youtube histórico.xlsx", sheet)
         return df
 
-    # ── Gráfico: visualizaciones diarias por video (sin revenue en este Excel) ─
     grafico = _yt_read("Datos del gráfico")
     if not grafico.empty:
         grafico = _to_dt(grafico, "Fecha")
         grafico = _safe_numeric(grafico, "Visualizaciones")
 
-    # ── Totales: views diarias agregadas del canal (fuente para evolución) ────
     totales = _yt_read("Totales")
     if not totales.empty:
         totales = _to_dt(totales, "Fecha")
         totales = _safe_numeric(totales, "Visualizaciones")
 
-    # Revenue total = suma de ingresos por video en tabla (no hay serie diaria)
     rev_total = 0.0
     if not tabla.empty and "Ingresos estimados (USD)" in tabla.columns:
         rev_total = float(tabla["Ingresos estimados (USD)"].sum())
@@ -363,7 +363,7 @@ def load_youtube():
         "tabla":     tabla   if not tabla.empty   else pd.DataFrame(),
         "grafico":   grafico if not grafico.empty else pd.DataFrame(),
         "totales":   totales if not totales.empty else pd.DataFrame(),
-        "rev_total": rev_total,  # float: ingresos totales del período en tabla
+        "rev_total": rev_total,
     }
 
 
@@ -373,10 +373,6 @@ def load_youtube():
 
 @st.cache_data(ttl=3600)
 def load_viads() -> pd.DataFrame:
-    """
-    Lee el CSV de VIADS (statistics_YYYY-MM-DD_YYYY-MM-DD.csv).
-    Formato: Date;Impressions;Clicks;CTR;CPM;Income
-    """
     import glob as _glob
     candidates = (
         list(DATA_DIR.glob("statistics_*.csv")) +
@@ -392,7 +388,6 @@ def load_viads() -> pd.DataFrame:
     if df.empty:
         return df
 
-    # Si vino con separador ; embebido en una sola columna, expandirlo
     if len(df.columns) == 1:
         raw_col = df.columns[0]
         cols    = [c.strip() for c in raw_col.split(";")]
@@ -423,7 +418,6 @@ def load_viads() -> pd.DataFrame:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def _load_social_base(fname: str, num_cols: list, id_col: str = "identificador de la publicación") -> pd.DataFrame:
-    """Base compartida para Instagram Posts, Stories y Facebook."""
     df = _read_csv_robust(fname)
     if df.empty:
         return df
@@ -485,7 +479,7 @@ def load_facebook() -> pd.DataFrame:
 
 @st.cache_data(ttl=3600)
 def load_produccion_con_metricas() -> pd.DataFrame:
-    prod = load_produccion()
+    prod = load_produccion()   # ya viene deduplicado desde load_produccion()
     urls = load_ga4_urls()
     if prod.empty:
         return prod
@@ -499,6 +493,19 @@ def load_produccion_con_metricas() -> pd.DataFrame:
         return result
 
     urls_w = urls.copy()
+
+    # ── DEDUPLICACIÓN de URLs: colapsar todas las fechas del mismo pagePath ───
+    # Evita que el mismo URL aparezca N veces (una por día) y multiplique
+    # las vistas al hacer el merge con producción.
+    if "pagePath" in urls_w.columns:
+        agg_url_kw = {}
+        if "screenPageViews" in urls_w.columns: agg_url_kw["screenPageViews"] = ("screenPageViews", "sum")
+        if "activeUsers"     in urls_w.columns: agg_url_kw["activeUsers"]     = ("activeUsers",     "sum")
+        if "pageTitle"       in urls_w.columns: agg_url_kw["pageTitle"]       = ("pageTitle",       "first")
+        if agg_url_kw:
+            urls_w = urls_w.groupby("pagePath", as_index=False).agg(**agg_url_kw)
+
+    # Campos auxiliares para matching
     if "pagePath" in urls_w.columns:
         urls_w["_ga4_post_id"] = urls_w["pagePath"].apply(_post_id_from_path)
         urls_w["_ga4_slug"]    = urls_w["pagePath"].apply(_slug_from_path)
@@ -561,7 +568,9 @@ def load_produccion_con_metricas() -> pd.DataFrame:
     result["ga4_views"] = result["ga4_views"].fillna(0).astype(int)
     result["ga4_users"] = result["ga4_users"].fillna(0).astype(int)
     tags_col = result["tags"] if "tags" in result.columns else pd.Series("", index=result.index)
-    result["is_ia"] = tags_col.apply(lambda x: bool(re.search(r"\\bIA\\b|\\binteligencia[\\s_-]?artificial\\b", str(x), re.I)))
+    result["is_ia"] = tags_col.apply(
+        lambda x: bool(re.search(r"\bIA\b|\binteligencia[\s_-]?artificial\b", str(x), re.I))
+    )
     return result
 
 
