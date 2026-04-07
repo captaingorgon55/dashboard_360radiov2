@@ -621,39 +621,20 @@ def load_facebook() -> pd.DataFrame:
 # MATCHING PRODUCCION  <->  GA4
 # =============================================================================
 
+
 @st.cache_data(ttl=3600)
 def load_produccion_con_metricas() -> pd.DataFrame:
-    with ThreadPoolExecutor(max_workers=2) as ex:
-        f_prod = ex.submit(load_produccion)
-        f_urls = ex.submit(load_ga4_urls)
-        prod = f_prod.result()
-        urls = f_urls.result()
+    result = load_produccion()
 
-    if prod.empty:
-        return prod
+    if result.empty:
+        return result
 
-    if _HAS_MATCHING and _match_prod_fn is not None:
-        result = _match_prod_fn(prod, urls)
-    else:
-        result = prod.copy()
-        result["ga4_views"]    = 0
-        result["ga4_users"]    = 0
-        result["match_method"] = "sin_match"
+    raw_tags = result["tags"] if "tags" in result.columns else pd.Series("", index=result.index)
+    raw_author = result["post_author_name"] if "post_author_name" in result.columns else pd.Series("", index=result.index)
 
-    # ── Limpiar tags y author ANTES de resolver  (Fix v4.3) ──────────────────
-    # Cuando _read_excel serializa a parquet convierte NaN → "nan" (string).
-    # _clean_str() normaliza eso a "" para que las funciones funcionen bien.
-
-    raw_tags   = result["tags"]             if "tags"             in result.columns \
-                 else pd.Series("", index=result.index)
-    raw_author = result["post_author_name"] if "post_author_name" in result.columns \
-                 else pd.Series("", index=result.index)
-
-    # Vectorizar la limpieza
-    tags_clean   = raw_tags.map(_clean_str)
+    tags_clean = raw_tags.map(_clean_str)
     author_clean = raw_author.map(_clean_str)
 
-    # Resolver autor real cuando es genérico y hay alias en tags
     result["author_resolved"] = [
         _resolve_author(a, t)
         for a, t in zip(author_clean, tags_clean)
@@ -668,8 +649,14 @@ def load_produccion_con_metricas() -> pd.DataFrame:
         for t, a in zip(tags_clean, author_clean)
     ]
 
-    return result
+    if "ga4_views" not in result.columns:
+        result["ga4_views"] = 0
+    if "ga4_users" not in result.columns:
+        result["ga4_users"] = 0
+    if "match_method" not in result.columns:
+        result["match_method"] = "produccion"
 
+    return result
 
 
 # =============================================================================
