@@ -386,24 +386,30 @@ def load_search_console():
 
 
 @st.cache_data(ttl=3600)
+
 def load_produccion():
-    df = _read_csv_robust("Produccion.csv")
+    df = _read_excel("Produccion.xlsx", "Notas + Trafico")
     if df.empty:
         return df
+
     df = _to_dt(_to_dt(df, "post_date"), "post_modified")
-    # filtrar desde 2025-01-01
+
     if "post_date" in df.columns:
         df = df[df["post_date"] >= PRODUCCION_DESDE].copy().reset_index(drop=True)
-    if "post_id"    in df.columns:
-        df["post_id"]     = pd.to_numeric(df["post_id"], errors="coerce")
+
+    if "post_id" in df.columns:
+        df["post_id"] = pd.to_numeric(df["post_id"], errors="coerce")
+
     if "post_title" in df.columns:
         df["_title_norm"] = df["post_title"].apply(_norm_title)
-    if "url" in df.columns:
-        df["_prod_slug"]  = df["url"].apply(_slug_from_url)
-        df["_prod_path"]  = df["url"].apply(
-            lambda u: urlparse(str(u)).path.rstrip("/").lower() if pd.notna(u) else "")
-    return df
 
+    if "url" in df.columns:
+        df["_prod_slug"] = df["url"].apply(_slug_from_url)
+        df["_prod_path"] = df["url"].apply(
+            lambda u: urlparse(str(u)).path.rstrip("/").lower() if pd.notna(u) else ""
+        )
+
+    return df
 
 @st.cache_data(ttl=3600)
 def load_adsense():
