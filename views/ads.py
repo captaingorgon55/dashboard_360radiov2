@@ -5,12 +5,8 @@ import numpy as np
 import plotly.express as px
 import plotly.graph_objects as go
 from datetime import date, timedelta
-from data_loader import (
-    loadga4general, loadga4city, loadga4country, loadga4channel,
-    loadga4age, loadga4device, loadga4interests, loadga4urls,
-    loadproduccionconmetricas, filterbydate, fmtnumber, safesum,
-    getdaterange, deltastr, matchstats
-)
+from data_loader import load_adsense, load_mgid, load_admanager, load_youtube, filter_by_date, fmt_number, safe_sum, get_date_range, pct_delta
+
 C   = ["#6366f1","#06b6d4","#10b981","#f59e0b","#ef4444","#8b5cf6"]
 PBG = "#0d0d20"
 
