@@ -398,33 +398,43 @@ def load_viads() -> pd.DataFrame:
 
 @st.cache_data(ttl=3600)
 def load_youtube():
-    base = "Youtube.xlsx"
-    src = DATA_DIR / base
-    if not src.exists():
+    for base in ["Youtube.xlsx", "Youtube histórico.xlsx"]:
+        src = DATA_DIR / base
+        if src.exists():
+            break
+    else:
         return {"tabla": pd.DataFrame(), "grafico": pd.DataFrame(), "totales": pd.DataFrame()}
+
     try:
         df = pd.read_excel(src, sheet_name=0)
     except Exception:
         try:
             df = pd.read_excel(src, sheet_name=0, engine="openpyxl")
         except Exception:
-            df = pd.DataFrame()
+            return {"tabla": pd.DataFrame(), "grafico": pd.DataFrame(), "totales": pd.DataFrame()}
+
+    df.columns = [str(c).strip() for c in df.columns]
     df = _safe_numeric(
         df,
         "Visualizaciones", "Impresiones", "Suscriptores",
-        "Ingresos estimados (USD)", "Tiempo de visualización (horas)",
+        "Ingresos estimados (USD)", "Ingresos",
+        "Ingresos estimados", "Revenue", "Revenue (USD)",
+        "Tiempo de visualización (horas)",
         "Porcentaje de clics de las impresiones (%)"
     )
-    fecha_col = "Hora de publicación del vídeo"
-    if fecha_col in df.columns:
+
+    fecha_col = None
+    for c in ["Hora de publicación del vídeo", "Fecha", "Date", "DATE"]:
+        if c in df.columns:
+            fecha_col = c
+            break
+
+    if fecha_col:
         raw = df[fecha_col].astype(str).str.strip()
-        raw = raw.str.replace(r"\s*,\s*", ", ", regex=True)
-        parsed = pd.to_datetime(raw, format="%b %d, %Y", errors="coerce")
-        mask = parsed.isna()
-        if mask.any():
-            parsed[mask] = pd.to_datetime(raw[mask], errors="coerce", dayfirst=False)
-        df[fecha_col] = parsed
+        parsed = pd.to_datetime(raw, errors="coerce")
         df["Fecha"] = parsed
+        if fecha_col != "Fecha":
+            df["Fecha"] = parsed
 
     return {"tabla": df, "grafico": df, "totales": pd.DataFrame()}
 
