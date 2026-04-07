@@ -1,4 +1,7 @@
 import streamlit as st
+from pathlib import Path
+import shutil
+import os
 
 st.set_page_config(
     page_title="360Radio · Analytics",
@@ -6,6 +9,31 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="expanded",
 )
+
+CACHE_DIR = Path(".parquet_cache")
+
+def clear_all_cache():
+    try:
+        st.cache_data.clear()
+    except Exception:
+        pass
+
+    try:
+        st.cache_resource.clear()
+    except Exception:
+        pass
+
+    try:
+        if CACHE_DIR.exists():
+            shutil.rmtree(CACHE_DIR, ignore_errors=True)
+    except Exception:
+        pass
+
+    try:
+        CACHE_DIR.mkdir(exist_ok=True)
+    except Exception:
+        pass
+
 
 st.markdown("""
 <style>
@@ -95,16 +123,31 @@ ul[data-testid="stSidebarNavItems"]  { display:none !important; }
 [data-testid="stSelectbox"] > div > div,
 [data-testid="stDateInput"] input  { background:#0c0c24 !important; border-color:#20204a !important; }
 hr { border-color:#181836 !important; margin:.8rem 0 !important; }
+
+/* ── Botones sidebar ─────────────────────────────────────────── */
+.stButton > button {
+    width:100%;
+    border-radius:10px;
+    border:1px solid #25254a;
+    background:#11112d;
+    color:#dbe4ff !important;
+    font-weight:600;
+}
+.stButton > button:hover {
+    border-color:#4f46e5;
+    background:#17173b;
+    color:#ffffff !important;
+}
 </style>
 """, unsafe_allow_html=True)
 
 # ── Páginas ────────────────────────────────────────────────────────────────────
 PAGES = {
     "🏠  General · Tráfico":   "views/general.py",
-    "🔍  Search Console":       "views/search.py",
-    "📱  Social Media":         "views/social.py",
-    "💰  Ads y Monetización":   "views/ads.py",
-    "📣  Pauta":                "views/pauta.py",
+    "🔍  Search Console":      "views/search.py",
+    "📱  Social Media":        "views/social.py",
+    "💰  Ads y Monetización":  "views/ads.py",
+    "📣  Pauta":               "views/pauta.py",
 }
 
 with st.sidebar:
@@ -120,9 +163,26 @@ with st.sidebar:
     )
 
     st.markdown('<hr class="sb-divider">', unsafe_allow_html=True)
-    st.markdown('<span style="font-size:.62rem;color:#1e2040">v3.0 · 360Radio Analytics</span>',
-                unsafe_allow_html=True)
+
+    if st.button("🧹 Limpiar caché", use_container_width=True):
+        clear_all_cache()
+        st.success("Caché limpiada correctamente.")
+        st.rerun()
+
+    if st.button("🔄 Recargar todo", use_container_width=True):
+        st.rerun()
+
+    st.markdown('<hr class="sb-divider">', unsafe_allow_html=True)
+    st.markdown(
+        '<span style="font-size:.62rem;color:#1e2040">v3.1 · 360Radio Analytics</span>',
+        unsafe_allow_html=True
+    )
 
 page_path = PAGES[selection]
+
+if not os.path.exists(page_path):
+    st.error(f"No se encontró la vista: {page_path}")
+    st.stop()
+
 with open(page_path, encoding="utf-8") as fh:
     exec(compile(fh.read(), page_path, "exec"), {"__name__": "__main__"})
