@@ -589,7 +589,7 @@ def load_facebook() -> pd.DataFrame:
 # =============================================================================
 
 @st.cache_data(ttl=3600)
-@st.cache_data(ttl=3600)
+
 def load_notas_trafico():
     """
     Nuevo loader unificado desde Excel:
@@ -603,7 +603,36 @@ def load_notas_trafico():
         return df
 
     # 🔹 Normalizar columnas
-    df.columns = [c.strip() for c in df.columns]
+    # 🔹 Normalizar columnas
+    df.columns = [c.strip().lower() for c in df.columns]
+    
+    # 🔥 MAPEO AUTOMÁTICO DE NOMBRES
+    rename_map = {
+        "autor": "post_author_name",
+        "author": "post_author_name",
+        "post author": "post_author_name",
+        
+        "categoria": "categories",
+        "categorias": "categories",
+        "section": "categories",
+    
+        "views": "screenpageviews",
+        "pageviews": "screenpageviews",
+    
+        "usuarios": "activeusers",
+        "users": "activeusers",
+    
+        "fecha": "post_date",
+        "date": "post_date"
+    }
+    
+    df = df.rename(columns={k: v for k, v in rename_map.items() if k in df.columns})
+    
+    # 🔥 devolver nombres estándar
+    df = df.rename(columns={
+        "screenpageviews": "screenPageViews",
+        "activeusers": "activeUsers"
+    })
 
     # 🔹 Fechas
     if "post_date" in df.columns:
