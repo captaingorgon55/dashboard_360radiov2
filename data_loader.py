@@ -26,7 +26,7 @@ CACHE_DIR = Path(".parquet_cache")
 CACHE_DIR.mkdir(exist_ok=True)
 
 # Nombre del Excel consolidado (colócalo en data/)
-NOTAS_EXCEL = "notas_con_trafico.xlsx"
+NOTAS_EXCEL = "Produccion.xlsx"
 
 PRODUCCION_DESDE = pd.Timestamp("2025-01-01")
 
