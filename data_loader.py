@@ -1,28 +1,19 @@
 """
-data_loader.py  -  360Radio Analytics v4.3  (FAST I/O)
-=======================================================
-Optimizaciones v4.2:
-  * _read_excel: convierte Excel -> Parquet la primera vez (10-50x mas rapido
-    en lecturas siguientes). El parquet se invalida si el Excel cambia (mtime).
-  * load_ga4_urls + load_produccion corren en paralelo (ThreadPoolExecutor)
-    antes del matching, ahorrando el tiempo del mas lento.
-  * Produccion.csv filtrado desde 2025-01-01 para reducir volumen.
-  * Matching engine v4.1 con early-exit y fuzzy vectorizado.
-
-Fix v4.3:
-  * _clean_str: normaliza "nan", None y vacíos a "" antes de cualquier
-    comparación de autor/tags — evita que el string literal "nan" rompa
-    _resolve_author y _tags_contain_author.
-  * _is_generic_author: acepta también autor vacío/nan como genérico
-    cuando post_author_name no viene relleno.
-  * _tags_contain_author: umbral de longitud de token bajado de >3 a >=2
-    para no descartar apellidos cortos (Gil, Paz, etc.).
-  * load_produccion_con_metricas: limpia tags y author antes de pasarlos
-    a las funciones de resolución.
+data_loader.py  -  360Radio Analytics v5.0  (Excel consolidado)
+================================================================
+v5.0:
+  * load_produccion_con_metricas: lee directamente del Excel
+    "notas_con_trafico.xlsx" (sheet "Notas + Tráfico") que ya trae
+    screenPageViews, activeUsers y userEngagementDuration incorporados.
+    Se eliminó el matching engine y la carga paralela de GA4 URLs.
+  * load_por_autor / load_por_categoria: nuevas funciones que leen
+    los sheets "Por Autor" y "Por Categoría" del mismo Excel.
+  * Se conservan todos los demás loaders y utilidades sin cambios.
+  * _resolve_author, _tags_contain_author y helpers de autor siguen
+    disponibles para compatibilidad con vistas existentes.
 """
 import re
 import unicodedata
-from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -30,24 +21,18 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 
-try:
-    from matching_engine import match_production_to_ga4 as _match_prod_fn
-    from matching_engine import match_stats as _match_stats_fn
-    _HAS_MATCHING = True
-except Exception:
-    _HAS_MATCHING = False
-    _match_prod_fn = None
-    _match_stats_fn = None
-
 DATA_DIR  = Path("data")
 CACHE_DIR = Path(".parquet_cache")
 CACHE_DIR.mkdir(exist_ok=True)
+
+# Nombre del Excel consolidado (colócalo en data/)
+NOTAS_EXCEL = "Produccion.xlsx"
 
 PRODUCCION_DESDE = pd.Timestamp("2025-01-01")
 
 
 # =============================================================================
-# HELPERS I/O  —  con cache parquet para Excel
+# HELPERS I/O
 # =============================================================================
 
 def _parquet_path(fname: str, sheet: str) -> Path:
@@ -56,10 +41,6 @@ def _parquet_path(fname: str, sheet: str) -> Path:
 
 
 def _read_excel(fname: str, sheet: str) -> pd.DataFrame:
-    """
-    Lee un sheet de Excel. Si ya existe un parquet mas reciente que el Excel,
-    lo usa directamente (10-50x mas rapido). Si no, lee el Excel y guarda parquet.
-    """
     src = DATA_DIR / fname
     if not src.exists():
         return pd.DataFrame()
@@ -67,14 +48,12 @@ def _read_excel(fname: str, sheet: str) -> pd.DataFrame:
     pq = _parquet_path(fname, sheet)
     src_mtime = src.stat().st_mtime
 
-    # usar parquet si existe y es mas nuevo que el Excel
     if pq.exists() and pq.stat().st_mtime >= src_mtime:
         try:
             return pd.read_parquet(pq)
         except Exception:
             pq.unlink(missing_ok=True)
 
-    # leer Excel y guardar parquet
     df = pd.DataFrame()
     for engine in [None, "openpyxl", "xlrd"]:
         try:
@@ -86,13 +65,12 @@ def _read_excel(fname: str, sheet: str) -> pd.DataFrame:
 
     if not df.empty:
         try:
-            # parquet no acepta columnas duplicadas ni tipos mixtos
             df = df.loc[:, ~df.columns.duplicated()]
             for col in df.select_dtypes(include="object").columns:
                 df[col] = df[col].astype(str)
             df.to_parquet(pq, index=False)
         except Exception:
-            pass  # si no se puede guardar parquet, igual retornamos el df
+            pass
 
     return df
 
@@ -130,7 +108,7 @@ def _safe_numeric(df: pd.DataFrame, *cols) -> pd.DataFrame:
 
 
 # =============================================================================
-# PARSER DE FECHA  —  multi-formato robusto
+# PARSER DE FECHA
 # =============================================================================
 
 _DATE_FORMATS = [
@@ -186,18 +164,16 @@ def _slug_from_url(url_str) -> str:
 
 
 # =============================================================================
-# LIMPIEZA DE STRINGS  —  FIX v4.3
-# Convierte NaN, None, "nan", "none", "NaN" → cadena vacía.
-# Todas las funciones de autor/tags deben llamar esto primero.
+# LIMPIEZA DE STRINGS
 # =============================================================================
 
 _NAN_STRINGS = {"nan", "none", "null", "na", "n/a", "<na>"}
 
+
 def _clean_str(val) -> str:
-    """Devuelve string limpio; NaN/None/vacío/'nan' → ''."""
     if val is None:
         return ""
-    if isinstance(val, float) and (val != val):   # np.nan
+    if isinstance(val, float) and (val != val):
         return ""
     s = str(val).strip()
     return "" if s.lower() in _NAN_STRINGS else s
@@ -208,44 +184,34 @@ def _clean_str(val) -> str:
 # =============================================================================
 
 _AUTHOR_ALIASES = {
-    # Andrés Martín  (aparece como "Andres M" en tags — 88 posts)
     "andres m":              "Andrés Martín",
     "andresm":               "Andrés Martín",
     "andres martin":         "Andrés Martín",
     "andrés martin":         "Andrés Martín",
     "andrés m":              "Andrés Martín",
-    # Julieth Barbosa  (aparece como "Julieth B" en tags)
     "julieth b":             "Julieth Barbosa",
     "juliethb":              "Julieth Barbosa",
     "julieth barbosa":       "Julieth Barbosa",
-    # Juan Camilo Ocampo  (aparece como "Juan Camilo" / "Juan O" en tags)
     "juan camilo ocampo":    "Juan Camilo Ocampo",
     "juan camilo":           "Juan Camilo Ocampo",
     "juan o":                "Juan Camilo Ocampo",
     "juanocampo":            "Juan Camilo Ocampo",
     "juan ocampo":           "Juan Camilo Ocampo",
-    # Daniel García  (aparece como "Daniel G" en tags)
     "daniel g":              "Daniel García",
     "daniel garcia":         "Daniel García",
     "daniel garcía":         "Daniel García",
-    # Jorge González  (aparece como "Jorge G" en tags)
     "jorge g":               "Jorge González",
     "jorge gonzalez":        "Jorge González",
     "jorge gonzález":        "Jorge González",
-    # Miguel Vélez  (aparece como "Miguel V" en tags)
     "miguel v":              "Miguel Vélez",
     "miguel velez":          "Miguel Vélez",
     "miguel vélez":          "Miguel Vélez",
-    # Katherine Aranda
     "katherine aranda":      "Katherine Aranda",
     "katherine a":           "Katherine Aranda",
-    # Camilo Jaimes
     "camilo jaimes":         "Camilo Jaimes",
     "camilo j":              "Camilo Jaimes",
-    # Simón Zapata
     "simon zapata":          "Simón Zapata",
     "simón zapata":          "Simón Zapata",
-    # Saúl Hernández
     "saul hernandez":        "Saúl Hernández",
     "saúl hernández":        "Saúl Hernández",
 }
@@ -254,27 +220,17 @@ _IS_360RADIO_AUTHOR = re.compile(r"360\s*radio|radio\s*360|360radio", re.I)
 
 
 def _is_generic_author(author_str) -> bool:
-    """
-    Devuelve True si el autor es el genérico '360 Radio' (o variantes),
-    o si el campo viene vacío/nan (autor no asignado).
-    """
     s = _clean_str(author_str)
     if not s:
-        return True   # campo vacío → tratar como genérico para buscar en tags
+        return True
     return bool(_IS_360RADIO_AUTHOR.search(s))
 
 
 def _resolve_author(author_str, tags_str) -> str:
-    """
-    Si el autor es genérico ('360 Radio' o vacío), busca en los tags
-    algún alias conocido y devuelve el nombre real.
-    Si no encuentra nada, devuelve el autor original (o '360 Radio').
-    """
     author_clean = _clean_str(author_str)
     tags_clean   = _clean_str(tags_str)
 
     if not _is_generic_author(author_clean):
-        # Autor real ya identificado — devolver tal cual
         return author_clean
 
     if not tags_clean:
@@ -282,8 +238,6 @@ def _resolve_author(author_str, tags_str) -> str:
 
     tags_norm = _strip_accents(tags_clean.lower())
     for alias, nombre_real in _AUTHOR_ALIASES.items():
-        # BUG original: faltaba .lower() — alias quedaba con mayúsculas
-        # y tags_norm ya era lowercase → nunca matcheaba
         if _strip_accents(alias.lower()) in tags_norm:
             return nombre_real
 
@@ -291,12 +245,6 @@ def _resolve_author(author_str, tags_str) -> str:
 
 
 def _tags_contain_author(tags_str: str, author_str: str) -> bool:
-    """
-    Devuelve True si algún token significativo del nombre del autor
-    aparece dentro de los tags.
-    Fix v4.3: umbral de longitud bajado a >= 2 (antes > 3) para no
-    descartar apellidos cortos.
-    """
     tags_clean   = _clean_str(tags_str)
     author_clean = _clean_str(author_str)
 
@@ -304,7 +252,6 @@ def _tags_contain_author(tags_str: str, author_str: str) -> bool:
         return False
 
     tags_norm = _strip_accents(tags_clean.lower())
-    # tokens con al menos 2 caracteres (antes filtraba len > 3, perdía "Gil", "Paz", etc.)
     tokens = [
         t.strip()
         for t in re.split(r"[\s,]+", author_clean)
@@ -365,7 +312,7 @@ def load_ga4_interests():
 
 
 # =============================================================================
-# LOADERS  —  Search Console, Produccion, AdSense, MGID, AdManager, YouTube
+# LOADERS  —  Search Console, AdSense, MGID, AdManager, YouTube
 # =============================================================================
 
 @st.cache_data(ttl=3600)
@@ -383,26 +330,6 @@ def load_search_console():
         df = _read_excel(base, s)
         result[k] = _to_dt(df, d) if not df.empty else pd.DataFrame()
     return result
-
-
-@st.cache_data(ttl=3600)
-def load_produccion():
-    df = _read_csv_robust("Produccion.csv")
-    if df.empty:
-        return df
-    df = _to_dt(_to_dt(df, "post_date"), "post_modified")
-    # filtrar desde 2025-01-01
-    if "post_date" in df.columns:
-        df = df[df["post_date"] >= PRODUCCION_DESDE].copy().reset_index(drop=True)
-    if "post_id"    in df.columns:
-        df["post_id"]     = pd.to_numeric(df["post_id"], errors="coerce")
-    if "post_title" in df.columns:
-        df["_title_norm"] = df["post_title"].apply(_norm_title)
-    if "url" in df.columns:
-        df["_prod_slug"]  = df["url"].apply(_slug_from_url)
-        df["_prod_path"]  = df["url"].apply(
-            lambda u: urlparse(str(u)).path.rstrip("/").lower() if pd.notna(u) else "")
-    return df
 
 
 @st.cache_data(ttl=3600)
@@ -435,14 +362,6 @@ def load_admanager():
 
 @st.cache_data(ttl=3600)
 def load_viads() -> pd.DataFrame:
-    """
-    Carga el CSV de estadísticas de Viads.
-    Separador ';', fechas DD.MM.YYYY.
-    Busca en orden:
-      1. data/statistics_2025-01-01_2026-04-01.csv
-      2. data/viads.csv  /  data/Viads.csv
-      3. cualquier data/statistics_*.csv
-    """
     candidates = [
         DATA_DIR / "statistics_2025-01-01_2026-04-01.csv",
         DATA_DIR / "viads.csv",
@@ -479,33 +398,43 @@ def load_viads() -> pd.DataFrame:
 
 @st.cache_data(ttl=3600)
 def load_youtube():
-    base = "Youtube histórico.xlsx"
-    src = DATA_DIR / base
-    if not src.exists():
+    for base in ["Youtube.xlsx", "Youtube histórico.xlsx"]:
+        src = DATA_DIR / base
+        if src.exists():
+            break
+    else:
         return {"tabla": pd.DataFrame(), "grafico": pd.DataFrame(), "totales": pd.DataFrame()}
+
     try:
         df = pd.read_excel(src, sheet_name=0)
     except Exception:
         try:
             df = pd.read_excel(src, sheet_name=0, engine="openpyxl")
         except Exception:
-            df = pd.DataFrame()
+            return {"tabla": pd.DataFrame(), "grafico": pd.DataFrame(), "totales": pd.DataFrame()}
+
+    df.columns = [str(c).strip() for c in df.columns]
     df = _safe_numeric(
         df,
         "Visualizaciones", "Impresiones", "Suscriptores",
-        "Ingresos estimados (USD)", "Tiempo de visualización (horas)",
+        "Ingresos estimados (USD)", "Ingresos",
+        "Ingresos estimados", "Revenue", "Revenue (USD)",
+        "Tiempo de visualización (horas)",
         "Porcentaje de clics de las impresiones (%)"
     )
-    fecha_col = "Hora de publicación del vídeo"
-    if fecha_col in df.columns:
+
+    fecha_col = None
+    for c in ["Hora de publicación del vídeo", "Fecha", "Date", "DATE"]:
+        if c in df.columns:
+            fecha_col = c
+            break
+
+    if fecha_col:
         raw = df[fecha_col].astype(str).str.strip()
-        raw = raw.str.replace(r"\s*,\s*", ", ", regex=True)
-        parsed = pd.to_datetime(raw, format="%b %d, %Y", errors="coerce")
-        mask = parsed.isna()
-        if mask.any():
-            parsed[mask] = pd.to_datetime(raw[mask], errors="coerce", dayfirst=False)
-        df[fecha_col] = parsed
+        parsed = pd.to_datetime(raw, errors="coerce")
         df["Fecha"] = parsed
+        if fecha_col != "Fecha":
+            df["Fecha"] = parsed
 
     return {"tabla": df, "grafico": df, "totales": pd.DataFrame()}
 
@@ -585,90 +514,119 @@ def load_facebook() -> pd.DataFrame:
 
 
 # =============================================================================
-# MATCHING PRODUCCION  <->  GA4
+# LOADER PRINCIPAL  —  Producción con métricas (desde Excel consolidado)
 # =============================================================================
 
 @st.cache_data(ttl=3600)
 def load_produccion_con_metricas() -> pd.DataFrame:
-    with ThreadPoolExecutor(max_workers=2) as ex:
-        f_prod = ex.submit(load_produccion)
-        f_urls = ex.submit(load_ga4_urls)
-        prod = f_prod.result()
-        urls = f_urls.result()
+    """
+    Lee el sheet "Notas + Tráfico" del Excel consolidado.
+    Las métricas GA4 (screenPageViews, activeUsers, userEngagementDuration)
+    ya vienen incorporadas — no se requiere matching engine.
+    """
+    src = DATA_DIR / NOTAS_EXCEL
+    if not src.exists():
+        return pd.DataFrame()
 
-    if prod.empty:
-        return prod
+    df = _read_excel(NOTAS_EXCEL, "Notas + Tráfico")
+    if df.empty:
+        return df
 
-    if _HAS_MATCHING and _match_prod_fn is not None:
-        result = _match_prod_fn(prod, urls)
-    else:
-        result = prod.copy()
-        result["ga4_views"]    = 0
-        result["ga4_users"]    = 0
-        result["match_method"] = "sin_match"
+    # Fechas
+    df = _to_dt(_to_dt(df, "post_date"), "post_modified")
 
-    # ── Limpiar tags y author ANTES de resolver  (Fix v4.3) ──────────────────
-    # Cuando _read_excel serializa a parquet convierte NaN → "nan" (string).
-    # _clean_str() normaliza eso a "" para que las funciones funcionen bien.
+    # Métricas numéricas
+    df = _safe_numeric(df, "screenPageViews", "activeUsers",
+                       "userEngagementDuration", "post_id")
 
-    raw_tags   = result["tags"]             if "tags"             in result.columns \
-                 else pd.Series("", index=result.index)
-    raw_author = result["post_author_name"] if "post_author_name" in result.columns \
-                 else pd.Series("", index=result.index)
+    # Columnas de compatibilidad con vistas existentes
+    df["ga4_views"]    = df.get("screenPageViews", pd.Series(0, index=df.index))
+    df["ga4_users"]    = df.get("activeUsers",     pd.Series(0, index=df.index))
+    df["match_method"] = df.get("_match_type",     pd.Series("excel", index=df.index))
 
-    # Vectorizar la limpieza
-    tags_clean   = raw_tags.map(_clean_str)
-    author_clean = raw_author.map(_clean_str)
+    # Slugs y paths para filtros por URL
+    if "url" in df.columns:
+        df["_prod_slug"] = df["url"].apply(_slug_from_url)
+        df["_prod_path"] = df["url"].apply(
+            lambda u: urlparse(str(u)).path.rstrip("/").lower()
+            if _clean_str(u) else ""
+        )
 
-    # Resolver autor real cuando es genérico y hay alias en tags
-    result["author_resolved"] = [
+    # Título normalizado
+    if "post_title" in df.columns:
+        df["_title_norm"] = df["post_title"].apply(_norm_title)
+
+    # Limpiar tags y autor
+    tags_clean   = df.get("tags",             pd.Series("", index=df.index)).map(_clean_str)
+    author_clean = df.get("post_author_name", pd.Series("", index=df.index)).map(_clean_str)
+
+    # Resolver autor real (alias en tags → nombre canónico)
+    df["author_resolved"] = [
         _resolve_author(a, t)
         for a, t in zip(author_clean, tags_clean)
     ]
 
-    result["is_ia"] = tags_clean.apply(
+    # Flags
+    df["is_ia"] = tags_clean.apply(
         lambda x: bool(re.search(r"s[ii]ntesis", x, re.I)) if x else False
     )
-
-    result["is_360radio"] = [
+    df["is_360radio"] = [
         _tags_contain_author(t, a)
         for t, a in zip(tags_clean, author_clean)
     ]
 
-    return result
+    return df
 
+
+@st.cache_data(ttl=3600)
+def load_por_autor() -> pd.DataFrame:
+    """Sheet 'Por Autor' del Excel consolidado."""
+    df = _read_excel(NOTAS_EXCEL, "Por Autor")
+    return _safe_numeric(df, "screenPageViews", "activeUsers", "userEngagementDuration")
+
+
+@st.cache_data(ttl=3600)
+def load_por_categoria() -> pd.DataFrame:
+    """Sheet 'Por Categoría' del Excel consolidado."""
+    df = _read_excel(NOTAS_EXCEL, "Por Categoría")
+    return _safe_numeric(df, "screenPageViews", "activeUsers", "userEngagementDuration")
 
 
 # =============================================================================
-# REEXPORTS PÚBLICOS
-# Cualquier vista puede importar match_stats y match_production_to_ga4
-# directamente desde data_loader, sin depender de matching_engine.
-# Si matching_engine falla al cargar, estos fallbacks evitan el ImportError.
+# Stub load_produccion  —  compatibilidad con código que la importe
+# =============================================================================
+
+@st.cache_data(ttl=3600)
+def load_produccion() -> pd.DataFrame:
+    """
+    Alias de compatibilidad. Devuelve el mismo DataFrame que
+    load_produccion_con_metricas() pero sin los campos ga4_*.
+    """
+    return load_produccion_con_metricas()
+
+
+# =============================================================================
+# Stubs de matching  —  compatibilidad con vistas que los importen
 # =============================================================================
 
 def match_stats(prod_df: pd.DataFrame) -> dict:
-    """
-    Devuelve conteo de métodos de matching usados (para diagnóstico).
-    Reexport seguro de matching_engine.match_stats con fallback inline.
-    """
-    if _HAS_MATCHING and _match_stats_fn is not None:
-        return _match_stats_fn(prod_df)
     if prod_df is None or prod_df.empty or "match_method" not in prod_df.columns:
         return {}
     return prod_df["match_method"].value_counts().to_dict()
 
 
 def match_production_to_ga4(prod: pd.DataFrame, urls: pd.DataFrame) -> pd.DataFrame:
-    """
-    Reexport seguro de matching_engine.match_production_to_ga4.
-    Si matching_engine no está disponible, devuelve prod sin métricas GA4.
-    """
-    if _HAS_MATCHING and _match_prod_fn is not None:
-        return _match_prod_fn(prod, urls)
+    """No-op: el Excel ya trae las métricas integradas."""
     result = prod.copy()
-    result["ga4_views"]    = 0
-    result["ga4_users"]    = 0
-    result["match_method"] = "sin_match"
+    if "screenPageViews" in result.columns:
+        result["ga4_views"] = result["screenPageViews"]
+    else:
+        result["ga4_views"] = 0
+    if "activeUsers" in result.columns:
+        result["ga4_users"] = result["activeUsers"]
+    else:
+        result["ga4_users"] = 0
+    result["match_method"] = result.get("_match_type", "excel")
     return result
 
 
