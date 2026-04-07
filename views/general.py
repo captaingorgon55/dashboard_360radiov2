@@ -6,10 +6,10 @@ import plotly.graph_objects as go
 from datetime import date, timedelta
 from urllib.parse import urlparse as _up
 from data_loader import (
-    loadga4general, loadga4city, loadga4country, loadga4channel,
-    loadga4age, loadga4device, loadga4interests, loadga4urls,
-    loadproduccionconmetricas, filterbydate, fmtnumber, safesum,
-    getdaterange, deltastr, matchstats
+    load_ga4_general, load_ga4_city, load_ga4_country, load_ga4_channel,
+    load_ga4_age, load_ga4_device, load_ga4_interests, load_ga4_urls,
+    load_produccion_con_metricas,
+    filter_by_date, fmt_number, safe_sum, get_date_range, _delta_str, match_stats
 )
 
 C   = ["#6366f1","#06b6d4","#10b981","#f59e0b","#ef4444","#8b5cf6","#ec4899","#14b8a6"]
