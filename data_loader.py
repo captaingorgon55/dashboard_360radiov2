@@ -398,7 +398,7 @@ def load_viads() -> pd.DataFrame:
 
 @st.cache_data(ttl=3600)
 def load_youtube():
-    base = "Youtube histórico.xlsx"
+    base = "Youtube_histórico.xlsx"
     src = DATA_DIR / base
     if not src.exists():
         return {"tabla": pd.DataFrame(), "grafico": pd.DataFrame(), "totales": pd.DataFrame()}
