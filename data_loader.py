@@ -319,7 +319,7 @@ def load_admanager():
 
 @st.cache_data(ttl=3600)
 def load_youtube():
-    base = "Youtube.xlsx"
+    base = "Youtube histórico.xlsx"
 
     # ── Tabla de videos (sin fecha diaria) ────────────────────────────────────
     tabla = _read_excel(base, "Datos de la tabla")
