@@ -635,10 +635,17 @@ def load_produccion_con_metricas() -> pd.DataFrame:
     tags_clean = raw_tags.map(_clean_str)
     author_clean = raw_author.map(_clean_str)
 
-    result["author_resolved"] = [
+    author_resolved = [
         _resolve_author(a, t)
         for a, t in zip(author_clean, tags_clean)
     ]
+
+    result["author_resolved"] = author_resolved
+
+    if "post_author_name" in result.columns:
+        result["post_author_name"] = pd.Series(author_resolved, index=result.index)
+    else:
+        result["post_author_name"] = pd.Series(author_resolved, index=result.index)
 
     result["is_ia"] = tags_clean.apply(
         lambda x: bool(re.search(r"s[ii]ntesis", x, re.I)) if x else False
@@ -646,7 +653,7 @@ def load_produccion_con_metricas() -> pd.DataFrame:
 
     result["is_360radio"] = [
         _tags_contain_author(t, a)
-        for t, a in zip(tags_clean, author_clean)
+        for t, a in zip(tags_clean, result["post_author_name"])
     ]
 
     if "ga4_views" not in result.columns:
@@ -657,8 +664,6 @@ def load_produccion_con_metricas() -> pd.DataFrame:
         result["match_method"] = "produccion"
 
     return result
-
-
 # =============================================================================
 # REEXPORTS PÚBLICOS
 # Cualquier vista puede importar match_stats y match_production_to_ga4
