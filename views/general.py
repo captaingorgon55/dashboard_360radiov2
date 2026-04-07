@@ -44,6 +44,16 @@ def _urls_to_daily(urls_df):
     agg  = {c: (c, "sum") for c in cols if c != "date"}
     return urls_df[cols].groupby("date", as_index=False).agg(**agg)
 
+def _dedup_prod(df: pd.DataFrame) -> pd.DataFrame:
+    """Garantía extra de deduplicación en UI: una fila por post_id."""
+    if df.empty:
+        return df
+    if "post_id" in df.columns:
+        return df.drop_duplicates(subset=["post_id"], keep="first")
+    if "url" in df.columns:
+        return df.drop_duplicates(subset=["url"], keep="first")
+    return df
+
 # ════════════════════════════════════════════════════════════════════════
 st.markdown('<div class="page-title">🏠 General · Tráfico y Producción</div>',
             unsafe_allow_html=True)
@@ -52,15 +62,6 @@ st.markdown('<div class="page-subtitle">GA4 · Producción editorial</div>',
 
 # ════════════════════════════════════════════════════════════════════════
 # CARGA
-# Los loaders deben mapear a las hojas del Excel v2:
-#   load_ga4_general()   → "01_General_Diario"
-#   load_ga4_device()    → "02_General_x_Device"
-#   load_ga4_age()       → "04_General_x_Edad"
-#   load_ga4_city()      → "05_General_x_Ciudad"
-#   load_ga4_channel()   → "06_General_x_Canal"
-#   load_ga4_country()   → "07_General_x_Pais"
-#   load_ga4_urls()      → "10_URLs_Diario"
-#   load_ga4_interests() → "15_BRANDING_General"
 # ════════════════════════════════════════════════════════════════════════
 with st.spinner("Cargando datos..."):
     ga4_r  = load_ga4_general()
@@ -148,7 +149,6 @@ pd_    = max((end - start).days, 1)
 prev_s = start - timedelta(days=pd_)
 prev_e = start - timedelta(days=1)
 
-# Filtros de dimensión GA4 — cada uno sobre su propio df
 if has_city and "city" in city.columns:
     city = city[city["city"] == sel_city].copy()
 if has_chan and "sessionDefaultChannelGroup" in chan.columns:
@@ -157,7 +157,7 @@ if has_chan and "sessionDefaultChannelGroup" in chan.columns:
 # ════════════════════════════════════════════════════════════════════════
 # FILTRAR PRODUCCIÓN
 # ════════════════════════════════════════════════════════════════════════
-prod = filter_by_date(prod_r, "post_date", start, end)
+prod = _dedup_prod(filter_by_date(prod_r, "post_date", start, end))
 if has_aut and "post_author_name" in prod.columns:
     prod = prod[prod["post_author_name"] == sel_aut].copy()
 if has_cat and "categories" in prod.columns:
@@ -176,18 +176,10 @@ if has_editorial and not prod.empty and not urls.empty and "pagePath" in urls.co
 
 # ════════════════════════════════════════════════════════════════════════
 # _src — FUENTE DE MÉTRICAS SEGÚN PRIORIDAD DE FILTROS
-#
-#   1. Editorial (autor/cat)  → urls filtradas → diario (tiene userEngagementDuration)
-#   2. Canal + Ciudad         → city df
-#   3. Canal solo             → chan df
-#   4. Ciudad solo            → city df
-#   5. Sin filtro             → ga4 (01_General_Diario) ← más preciso
-#
-# city / chan NO tienen userEngagementDuration → se muestra "—"
 # ════════════════════════════════════════════════════════════════════════
 def _prev_editorial(urls_r_full, prod_r_full, prev_s, prev_e, sel_aut, sel_cat, has_aut, has_cat):
     urls_p = filter_by_date(urls_r_full, "date", prev_s, prev_e)
-    prod_p = prod_r_full.copy()
+    prod_p = _dedup_prod(prod_r_full.copy())
     if has_aut and "post_author_name" in prod_p.columns:
         prod_p = prod_p[prod_p["post_author_name"] == sel_aut]
     if has_cat and "categories" in prod_p.columns:
@@ -234,7 +226,6 @@ elif has_city:
     captions.append(f"🏙️ **{sel_city}**")
 
 else:
-    # Sin filtro: usa 01_General_Diario directamente (más preciso, concuerda con GA4)
     _src   = ga4.copy()
     _src_p = filter_by_date(ga4_r, "date", prev_s, prev_e)
 
@@ -251,8 +242,6 @@ au   = int(safe_sum(_src, "activeUsers"));      au_p  = int(safe_sum(_src_p, "ac
 vw   = int(safe_sum(_src, "screenPageViews"));  vw_p  = int(safe_sum(_src_p, "screenPageViews"))
 ss   = int(safe_sum(_src, "sessions"));         ss_p  = int(safe_sum(_src_p, "sessions"))
 
-# userEngagementDuration: segundos totales / usuarios → promedio por usuario
-# Disponible en 01_General_Diario y 10_URLs_Diario; NO en city ni chan
 dur = (
     float(_src["userEngagementDuration"].sum() / max(au, 1))
     if not _src.empty and "userEngagementDuration" in _src.columns and au > 0
@@ -271,7 +260,6 @@ m6.metric("✍️ Publicaciones",  fmt_number(p_ct))
 
 # ════════════════════════════════════════════════════════════════════════
 # META Q1
-# Siempre usa ga4_r sin filtrar (meta global del sitio)
 # ════════════════════════════════════════════════════════════════════════
 sh("🎯 Meta Q1 — 750,000 Usuarios")
 ga4_q = filter_by_date(ga4_r, "date", date(end.year, 1, 1), date(end.year, 3, 31))
@@ -335,9 +323,6 @@ else:
 
 # ════════════════════════════════════════════════════════════════════════
 # G2: Canales de Tráfico
-# Siempre muestra todos los canales con chan_r filtrado por fecha.
-# Si hay sel_chan activo: caption con métricas del canal elegido.
-# Filtro editorial → no disponible.
 # ════════════════════════════════════════════════════════════════════════
 sh("📡 Canales de Tráfico")
 if has_editorial:
@@ -381,9 +366,6 @@ else:
 
 # ════════════════════════════════════════════════════════════════════════
 # G3: Ciudades Top 20
-# Siempre muestra todas las ciudades con city_r filtrado por fecha.
-# Si hay sel_city: caption con usuarios de esa ciudad.
-# Filtro editorial → no disponible.
 # ════════════════════════════════════════════════════════════════════════
 sh("🏙️ Tráfico por Ciudad — Top 20")
 if has_editorial:
@@ -474,10 +456,16 @@ with n1:
 
 with n2:
     st.markdown("**✍️ Autores más leídos**")
-    if not prod.empty and "post_author_name" in prod.columns and "ga4_views" in prod.columns:
+    # Deduplicar prod antes de agrupar para evitar sumar vistas de notas repetidas
+    prod_for_authors = _dedup_prod(prod)
+    if not prod_for_authors.empty and "post_author_name" in prod_for_authors.columns and "ga4_views" in prod_for_authors.columns:
         aa = (
-            prod.groupby("post_author_name", as_index=False)
-            .agg(Vistas=("ga4_views","sum"), Notas=("post_id","count"), Usuarios=("ga4_users","sum"))
+            prod_for_authors.groupby("post_author_name", as_index=False)
+            .agg(
+                Vistas   = ("ga4_views",  "sum"),
+                Notas    = ("post_id",    "count"),
+                Usuarios = ("ga4_users",  "sum"),
+            )
             .sort_values("Vistas", ascending=False).head(25)
         )
         aa["V/Nota"] = (aa["Vistas"] / aa["Notas"].clip(1)).round(0).astype(int)
@@ -493,8 +481,9 @@ with n2:
 # G6: Secciones
 # ════════════════════════════════════════════════════════════════════════
 sh("📂 Secciones")
-if not prod.empty and "categories" in prod.columns and "ga4_views" in prod.columns:
-    sp = prod.copy()
+prod_for_sections = _dedup_prod(prod)
+if not prod_for_sections.empty and "categories" in prod_for_sections.columns and "ga4_views" in prod_for_sections.columns:
+    sp = prod_for_sections.copy()
     sp["cat"] = sp["categories"].fillna("Sin cat").apply(
         lambda x: ", ".join([p.strip() for p in str(x).split(",") if p.strip()])
         if has_cat
@@ -526,8 +515,9 @@ else:
 # G7: Producción mensual
 # ════════════════════════════════════════════════════════════════════════
 sh("✍️ Producción por Mes")
-if not prod.empty and "post_date" in prod.columns:
-    tp = prod.copy()
+prod_for_monthly = _dedup_prod(prod)
+if not prod_for_monthly.empty and "post_date" in prod_for_monthly.columns:
+    tp = prod_for_monthly.copy()
     tp["mes"] = tp["post_date"].dt.to_period("M").astype(str)
     pm = tp.groupby("mes", as_index=False).agg(
         pub=("post_id", "count"),
@@ -545,8 +535,9 @@ if not prod.empty and "post_date" in prod.columns:
 # G8: Notas IA
 # ════════════════════════════════════════════════════════════════════════
 sh("🤖 Notas IA Más Leídas")
-if not prod.empty and "is_ia" in prod.columns:
-    ia = prod[prod["is_ia"]].sort_values("ga4_views", ascending=False).head(25)
+prod_for_ia = _dedup_prod(prod)
+if not prod_for_ia.empty and "is_ia" in prod_for_ia.columns:
+    ia = prod_for_ia[prod_for_ia["is_ia"]].sort_values("ga4_views", ascending=False).head(25)
     if not ia.empty:
         cols_ = [c for c in ["post_title","post_author_name","post_date",
                               "ga4_views","ga4_users","match_method"] if c in ia.columns]
@@ -613,7 +604,6 @@ with t2:
         st.info("Sin datos de dispositivos.")
 
 with t3:
-    # Intereses filtrados por fecha igual que el resto
     intr_r = load_ga4_interests()
     intr   = filter_by_date(intr_r, "date", start, end) if not intr_r.empty else intr_r
     if not intr.empty and "brandingInterest" in intr.columns:
