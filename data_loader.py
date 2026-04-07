@@ -385,23 +385,56 @@ def load_search_console():
     return result
 
 
+
 @st.cache_data(ttl=3600)
 def load_produccion():
-    df = _read_csv_robust("Produccion.csv")
+    for fname, sheet in [
+        ("Produccion.xlsx", "Notas + Trafico"),
+        ("Produccion.xlsx", "Notas+Trafico"),
+        ("Produccion.xlsx", "Notas Trafico"),
+    ]:
+        df = _read_excel(fname, sheet)
+        if not df.empty:
+            break
+    else:
+        df = _read_csv_robust("Produccion.csv")
+
     if df.empty:
         return df
-    df = _to_dt(_to_dt(df, "post_date"), "post_modified")
-    # filtrar desde 2025-01-01
+
+    df = df.loc[:, ~df.columns.duplicated()].copy()
+
+    for col in ["post_date", "post_modified"]:
+        if col in df.columns:
+            df = _to_dt(df, col)
+
     if "post_date" in df.columns:
         df = df[df["post_date"] >= PRODUCCION_DESDE].copy().reset_index(drop=True)
-    if "post_id"    in df.columns:
-        df["post_id"]     = pd.to_numeric(df["post_id"], errors="coerce")
+
+    if "post_id" in df.columns:
+        df["post_id"] = pd.to_numeric(df["post_id"], errors="coerce")
+
     if "post_title" in df.columns:
         df["_title_norm"] = df["post_title"].apply(_norm_title)
-    if "url" in df.columns:
-        df["_prod_slug"]  = df["url"].apply(_slug_from_url)
-        df["_prod_path"]  = df["url"].apply(
-            lambda u: urlparse(str(u)).path.rstrip("/").lower() if pd.notna(u) else "")
+
+    url_col = "url" if "url" in df.columns else ("permalink" if "permalink" in df.columns else None)
+    if url_col:
+        df["_prod_slug"] = df[url_col].apply(_slug_from_url)
+        df["_prod_path"] = df[url_col].apply(
+            lambda u: urlparse(str(u)).path.rstrip("/").lower() if pd.notna(u) else ""
+        )
+
+    for c in ["screenPageViews", "activeUsers", "userEngagementDuration"]:
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0)
+
+    if "screenPageViews" in df.columns and "ga4_views" not in df.columns:
+        df["ga4_views"] = df["screenPageViews"]
+    if "activeUsers" in df.columns and "ga4_users" not in df.columns:
+        df["ga4_users"] = df["activeUsers"]
+    if "_match_type" in df.columns and "match_method" not in df.columns:
+        df["match_method"] = df["_match_type"]
+
     return df
 
 
