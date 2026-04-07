@@ -380,7 +380,7 @@ def load_viads() -> pd.DataFrame:
     import glob as _glob
     candidates = (
         list(DATA_DIR.glob("statistics_*.csv")) +
-        list(DATA_DIR.glob("viads*.csv")) +
+        list(DATA_DIR.glob("viads.csv")) +
         list(DATA_DIR.glob("VIADS*.csv"))
     )
     if not candidates:
