@@ -5,7 +5,7 @@ import numpy as np
 import plotly.express as px
 import plotly.graph_objects as go
 from datetime import date, timedelta
-from data_loader import load_admanager, filter_by_date, fmt_number, safe_sum, get_date_range, pct_delta
+from data_loader import load_admanager, load_viads, filter_by_date, fmt_number, safe_sum, get_date_range, pct_delta
 
 C   = ["#6366f1","#06b6d4","#10b981","#f59e0b","#ef4444","#8b5cf6"]
 PBG = "#0d0d20"
@@ -33,6 +33,7 @@ gam    = load_admanager()
 diario = gam["diario"]
 orders = gam["orders"]
 fill   = gam["fill"]
+viads  = load_viads()
 
 min_d, max_d = get_date_range(diario, "DATE")
 
@@ -295,3 +296,75 @@ if not gam_men.empty and "YEAR_MONTH" in gam_men.columns:
     if "Fill Rate %" in gm_s.columns: nf4["Fill Rate %"] = "{:.1f}%"
     if "eCPM"        in gm_s.columns: nf4["eCPM"]        = "${:,.2f}"
     st.dataframe(gm_s.style.format(nf4), use_container_width=True, hide_index=True)
+
+# ── VIADS ─────────────────────────────────────────────────────────────────────
+sh("📡 VIADS · Video Ads")
+if viads.empty:
+    st.info("Sin datos de VIADS. Coloca el archivo `statistics_*.csv` en la carpeta `data/`.")
+else:
+    viads_f  = filter_by_date(viads, "date", start, end)
+    pd_v     = (end - start).days or 1
+    viads_fp = filter_by_date(viads, "date", start - timedelta(days=pd_v), start - timedelta(days=1))
+
+    if viads_f.empty:
+        st.info("Sin datos de VIADS para el período seleccionado.")
+    else:
+        # Métricas
+        v_impr  = int(safe_sum(viads_f, "impressions"))
+        v_cl    = int(safe_sum(viads_f, "clicks"))
+        v_inc   = float(safe_sum(viads_f, "income"))
+        v_cpm   = float(viads_f["cpm"].mean()) if "cpm" in viads_f.columns else 0
+        v_ctr   = float(viads_f["ctr"].mean()) if "ctr" in viads_f.columns else 0
+
+        v_impr_p = int(safe_sum(viads_fp, "impressions"))
+        v_cl_p   = int(safe_sum(viads_fp, "clicks"))
+        v_inc_p  = float(safe_sum(viads_fp, "income"))
+
+        vm1, vm2, vm3, vm4, vm5 = st.columns(5)
+        vm1.metric("👁 Impresiones",  fmt_number(v_impr), _delta(v_impr, v_impr_p))
+        vm2.metric("🖱️ Clicks",        fmt_number(v_cl),   _delta(v_cl,   v_cl_p))
+        vm3.metric("💵 Ingresos",      f"${v_inc:,.2f}",   _delta(v_inc,  v_inc_p))
+        vm4.metric("📊 CPM Promedio",  f"${v_cpm:.2f}")
+        vm5.metric("📈 CTR Promedio",  f"{v_ctr:.2f}%")
+
+        # Evolución mensual
+        sh("📈 VIADS · Evolución Mensual")
+        vd = viads_f.copy()
+        vd["mes"] = vd["date"].dt.to_period("M").astype(str)
+        ag_v = {}
+        if "impressions" in vd.columns: ag_v["impressions"] = "sum"
+        if "income"      in vd.columns: ag_v["income"]      = "sum"
+        if "clicks"      in vd.columns: ag_v["clicks"]      = "sum"
+        if ag_v:
+            vm = vd.groupby("mes").agg(ag_v).reset_index()
+            fv = go.Figure()
+            if "impressions" in vm.columns:
+                fv.add_trace(go.Bar(x=vm["mes"], y=vm["impressions"],
+                    name="Impresiones", marker_color=C[1], opacity=0.7))
+            if "income" in vm.columns:
+                fv.add_trace(go.Scatter(x=vm["mes"], y=vm["income"],
+                    name="Ingresos (USD)", mode="lines+markers",
+                    line=dict(color=C[3], width=2.5), yaxis="y2", marker=dict(size=7)))
+            fv.update_layout(
+                yaxis2=dict(overlaying="y", side="right", showgrid=False,
+                            tickprefix="$", tickfont=dict(color=C[3])),
+                legend=dict(orientation="h", y=1.12))
+            _fig(fv, 300)
+            st.plotly_chart(fv, use_container_width=True)
+
+        # Tabla diaria detalle
+        sh("📄 VIADS · Detalle Diario")
+        col_map_v = {
+            "date": "Fecha", "impressions": "Impresiones", "clicks": "Clicks",
+            "ctr": "CTR", "cpm": "CPM", "income": "Ingresos (USD)"
+        }
+        vd_show = viads_f[[c for c in col_map_v if c in viads_f.columns]].rename(columns=col_map_v)
+        if "Fecha" in vd_show.columns:
+            vd_show = vd_show.sort_values("Fecha", ascending=False)
+        nf_v = {}
+        if "Impresiones"   in vd_show.columns: nf_v["Impresiones"]   = "{:,.0f}"
+        if "Clicks"        in vd_show.columns: nf_v["Clicks"]        = "{:,.0f}"
+        if "CTR"           in vd_show.columns: nf_v["CTR"]           = "{:.2f}%"
+        if "CPM"           in vd_show.columns: nf_v["CPM"]           = "${:.2f}"
+        if "Ingresos (USD)" in vd_show.columns: nf_v["Ingresos (USD)"] = "${:,.2f}"
+        st.dataframe(vd_show.style.format(nf_v), use_container_width=True, hide_index=True, height=350)
