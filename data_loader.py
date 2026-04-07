@@ -589,56 +589,63 @@ def load_facebook() -> pd.DataFrame:
 # =============================================================================
 
 @st.cache_data(ttl=3600)
-def load_produccion_con_metricas() -> pd.DataFrame:
-    with ThreadPoolExecutor(max_workers=2) as ex:
-        f_prod = ex.submit(load_produccion)
-        f_urls = ex.submit(load_ga4_urls)
-        prod = f_prod.result()
-        urls = f_urls.result()
+@st.cache_data(ttl=3600)
+def load_notas_trafico():
+    """
+    Nuevo loader unificado desde Excel:
+    archivo: produccion.xlsx
+    hoja: 'Notas + Trafico'
+    """
 
-    if prod.empty:
-        return prod
+    df = _read_excel("produccion.xlsx", "Notas + Trafico")
 
-    if _HAS_MATCHING and _match_prod_fn is not None:
-        result = _match_prod_fn(prod, urls)
-    else:
-        result = prod.copy()
-        result["ga4_views"]    = 0
-        result["ga4_users"]    = 0
-        result["match_method"] = "sin_match"
+    if df.empty:
+        return df
 
-    # ── Limpiar tags y author ANTES de resolver  (Fix v4.3) ──────────────────
-    # Cuando _read_excel serializa a parquet convierte NaN → "nan" (string).
-    # _clean_str() normaliza eso a "" para que las funciones funcionen bien.
+    # 🔹 Normalizar columnas
+    df.columns = [c.strip() for c in df.columns]
 
-    raw_tags   = result["tags"]             if "tags"             in result.columns \
-                 else pd.Series("", index=result.index)
-    raw_author = result["post_author_name"] if "post_author_name" in result.columns \
-                 else pd.Series("", index=result.index)
+    # 🔹 Fechas
+    if "post_date" in df.columns:
+        df["post_date"] = pd.to_datetime(df["post_date"], errors="coerce")
 
-    # Vectorizar la limpieza
-    tags_clean   = raw_tags.map(_clean_str)
-    author_clean = raw_author.map(_clean_str)
-
-    # Resolver autor real cuando es genérico y hay alias en tags
-    result["author_resolved"] = [
-        _resolve_author(a, t)
-        for a, t in zip(author_clean, tags_clean)
-    ]
-
-    result["is_ia"] = tags_clean.apply(
-        lambda x: bool(re.search(r"s[ii]ntesis", x, re.I)) if x else False
+    # 🔹 Numéricos principales
+    df = _safe_numeric(df,
+        "screenPageViews",
+        "activeUsers",
+        "sessions",
+        "engagement"
     )
 
-    result["is_360radio"] = [
-        _tags_contain_author(t, a)
-        for t, a in zip(tags_clean, author_clean)
-    ]
+    # 🔹 Limpieza de texto
+    if "post_author_name" in df.columns:
+        df["post_author_name"] = df["post_author_name"].map(_clean_str)
 
-    return result
+    if "categories" in df.columns:
+        df["categories"] = df["categories"].map(_clean_str)
+
+    # 🔥 Renombrar a formato compatible con tu app
+    if "screenPageViews" in df.columns:
+        df["ga4_views"] = df["screenPageViews"]
+
+    if "activeUsers" in df.columns:
+        df["ga4_users"] = df["activeUsers"]
+
+    # 🔥 Flags compatibles
+    df["match_method"] = "excel_direct"
+    df["is_ia"] = False
+    df["is_360radio"] = False
+
+    return df
 
 
-
+@st.cache_data(ttl=3600)
+def load_produccion_con_metricas() -> pd.DataFrame:
+    """
+    Ahora usa directamente el Excel unificado
+    (sin matching, sin GA4 URLs, sin ThreadPool)
+    """
+    return load_notas_trafico()
 # =============================================================================
 # REEXPORTS PÚBLICOS
 # Cualquier vista puede importar match_stats y match_production_to_ga4
