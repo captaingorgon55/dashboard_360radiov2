@@ -284,18 +284,15 @@ def load_search_console():
 
 @st.cache_data(ttl=3600)
 def load_produccion():
-    """Lee el Excel de producción con tráfico ya incluido (notas_con_trafico.xlsx)."""
-    df = _read_excel("notas_con_trafico.xlsx", "Notas + Tráfico")
+    df = _read_csv_robust("Produccion.csv")
     if df.empty:
         return df
     df = _to_dt(_to_dt(df, "post_date"), "post_modified")
-    if "post_id" in df.columns:
-        df["post_id"] = pd.to_numeric(df["post_id"], errors="coerce")
-    # Normalizar columna de autor: el nombre real viene en 'post_author'
-    if "post_author" in df.columns:
-        df["post_author_name"] = df["post_author"]
-    # Métricas de tráfico ya vienen en el Excel
-    df = _safe_numeric(df, "screenPageViews", "activeUsers", "userEngagementDuration")
+    if "post_id"    in df.columns: df["post_id"]      = pd.to_numeric(df["post_id"], errors="coerce")
+    if "post_title" in df.columns: df["_title_norm"]  = df["post_title"].apply(_norm_title)
+    if "url"        in df.columns:
+        df["_prod_slug"] = df["url"].apply(_slug_from_url)
+        df["_prod_path"] = df["url"].apply(lambda u: urlparse(str(u)).path.rstrip("/") if pd.notna(u) else "")
     return df
 
 @st.cache_data(ttl=3600)
@@ -322,10 +319,12 @@ def load_admanager():
 
 @st.cache_data(ttl=3600)
 def load_youtube():
-    base = "Youtube histórico.xlsx"
+    base = "Youtube historico.xlsx"  # nombre sin tilde para compatibilidad de filesystem
 
-    # ── Tabla de videos (sin fecha diaria) ────────────────────────────────────
+    # ── Tabla de videos: revenue + métricas por video (sin fecha diaria) ──────
     tabla = _read_excel(base, "Datos de la tabla")
+    if tabla.empty:  # fallback con tilde
+        tabla = _read_excel("Youtube histórico.xlsx", "Datos de la tabla")
     if not tabla.empty:
         tabla = _safe_numeric(
             tabla,
@@ -333,31 +332,90 @@ def load_youtube():
             "Ingresos estimados (USD)", "Tiempo de visualización (horas)",
             "Porcentaje de clics de las impresiones (%)",
         )
-        # ✅ Normalizar "Hora de publicación del vídeo" → datetime limpio
         pub_col = "Hora de publicación del vídeo"
         if pub_col in tabla.columns:
             tabla[pub_col] = _parse_yt_pub_date(tabla[pub_col])
 
-    # ── Gráfico diario (tiene fecha) ──────────────────────────────────────────
-    grafico = _read_excel(base, "Datos del gráfico")
+    def _yt_read(sheet):
+        df = _read_excel(base, sheet)
+        if df.empty:
+            df = _read_excel("Youtube histórico.xlsx", sheet)
+        return df
+
+    # ── Gráfico: visualizaciones diarias por video (sin revenue en este Excel) ─
+    grafico = _yt_read("Datos del gráfico")
     if not grafico.empty:
         grafico = _to_dt(grafico, "Fecha")
-        grafico = _safe_numeric(
-            grafico,
-            "Visualizaciones", "Ingresos estimados (USD)",
-            "Impresiones", "Suscriptores",
-        )
+        grafico = _safe_numeric(grafico, "Visualizaciones")
 
-    # ── Totales ───────────────────────────────────────────────────────────────
-    totales = _read_excel(base, "Totales")
+    # ── Totales: views diarias agregadas del canal (fuente para evolución) ────
+    totales = _yt_read("Totales")
     if not totales.empty:
         totales = _to_dt(totales, "Fecha")
+        totales = _safe_numeric(totales, "Visualizaciones")
+
+    # Revenue total = suma de ingresos por video en tabla (no hay serie diaria)
+    rev_total = 0.0
+    if not tabla.empty and "Ingresos estimados (USD)" in tabla.columns:
+        rev_total = float(tabla["Ingresos estimados (USD)"].sum())
 
     return {
-        "tabla":   tabla   if not tabla.empty   else pd.DataFrame(),
-        "grafico": grafico if not grafico.empty else pd.DataFrame(),
-        "totales": totales if not totales.empty else pd.DataFrame(),
+        "tabla":     tabla   if not tabla.empty   else pd.DataFrame(),
+        "grafico":   grafico if not grafico.empty else pd.DataFrame(),
+        "totales":   totales if not totales.empty else pd.DataFrame(),
+        "rev_total": rev_total,  # float: ingresos totales del período en tabla
     }
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# LOADER VIADS
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@st.cache_data(ttl=3600)
+def load_viads() -> pd.DataFrame:
+    """
+    Lee el CSV de VIADS (statistics_YYYY-MM-DD_YYYY-MM-DD.csv).
+    Formato: Date;Impressions;Clicks;CTR;CPM;Income
+    """
+    import glob as _glob
+    candidates = (
+        list(DATA_DIR.glob("statistics_*.csv")) +
+        list(DATA_DIR.glob("viads*.csv")) +
+        list(DATA_DIR.glob("VIADS*.csv"))
+    )
+    if not candidates:
+        return pd.DataFrame()
+    path  = sorted(candidates)[-1]
+    fname = path.name
+
+    df = _read_csv_robust(fname)
+    if df.empty:
+        return df
+
+    # Si vino con separador ; embebido en una sola columna, expandirlo
+    if len(df.columns) == 1:
+        raw_col = df.columns[0]
+        cols    = [c.strip() for c in raw_col.split(";")]
+        rows    = df[raw_col].astype(str).str.split(";", expand=True)
+        rows.columns = cols[:len(rows.columns)]
+        df = rows.copy()
+
+    col_map = {
+        "Date": "date", "Fecha": "date",
+        "Impressions": "impressions", "Impresiones": "impressions",
+        "Clicks": "clicks",
+        "CTR": "ctr",
+        "CPM": "cpm",
+        "Income": "income", "Revenue": "income", "Ingresos": "income",
+    }
+    df = df.rename(columns={c: col_map.get(c, c) for c in df.columns})
+
+    if "date" in df.columns:
+        df["date"] = pd.to_datetime(
+            df["date"].astype(str).str.strip(), dayfirst=True, errors="coerce"
+        )
+    df = _safe_numeric(df, "impressions", "clicks", "ctr", "cpm", "income")
+    return df.dropna(subset=["date"]).reset_index(drop=True)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -427,21 +485,83 @@ def load_facebook() -> pd.DataFrame:
 
 @st.cache_data(ttl=3600)
 def load_produccion_con_metricas() -> pd.DataFrame:
-    """
-    Lee producción + tráfico directo desde notas_con_trafico.xlsx.
-    El Excel ya trae screenPageViews / activeUsers / userEngagementDuration
-    por nota, por lo que no se necesita matching con GA4.
-    """
-    result = load_produccion()
-    if result.empty:
+    prod = load_produccion()
+    urls = load_ga4_urls()
+    if prod.empty:
+        return prod
+    result = prod.copy()
+    result["ga4_views"]    = np.nan
+    result["ga4_users"]    = np.nan
+    result["match_method"] = "sin_match"
+    if urls.empty:
+        result[["ga4_views","ga4_users"]] = 0
+        result["is_ia"] = False
         return result
-    result = result.copy()
-    # Aliases ga4_views / ga4_users para compatibilidad con el resto del código
-    result["ga4_views"] = result["screenPageViews"].fillna(0).astype(int)
-    result["ga4_users"] = result["activeUsers"].fillna(0).astype(int)
-    result["match_method"] = "excel_directo"
+
+    urls_w = urls.copy()
+    if "pagePath" in urls_w.columns:
+        urls_w["_ga4_post_id"] = urls_w["pagePath"].apply(_post_id_from_path)
+        urls_w["_ga4_slug"]    = urls_w["pagePath"].apply(_slug_from_path)
+        urls_w["_ga4_clean"]   = urls_w["pagePath"].apply(lambda p: str(p).rstrip("/") if pd.notna(p) else "")
+    if "pageTitle" in urls_w.columns:
+        urls_w["_ga4_title"] = urls_w["pageTitle"].apply(_norm_title)
+
+    def _agg(key_col, rename_to):
+        if key_col not in urls_w.columns: return pd.DataFrame()
+        sub = urls_w.dropna(subset=[key_col])
+        sub = sub[sub[key_col].astype(str) != ""]
+        if sub.empty: return pd.DataFrame()
+        kws = {}
+        if "screenPageViews" in sub.columns: kws["ga4_views"] = ("screenPageViews","sum")
+        if "activeUsers"     in sub.columns: kws["ga4_users"] = ("activeUsers","sum")
+        if not kws: return pd.DataFrame()
+        return sub.groupby(key_col, as_index=False).agg(**kws).rename(columns={key_col: rename_to})
+
+    ga4_by_id    = _agg("_ga4_post_id", "_key_id")
+    ga4_by_title = _agg("_ga4_title",   "_key_title")
+    ga4_by_slug  = _agg("_ga4_slug",    "_key_slug")
+    ga4_by_path  = _agg("_ga4_clean",   "_key_path")
+    if not ga4_by_id.empty:
+        ga4_by_id["_key_id"] = pd.to_numeric(ga4_by_id["_key_id"], errors="coerce")
+
+    def _assign(merged_df, method_name):
+        no_match = result["match_method"] == "sin_match"
+        hit      = merged_df["ga4_views"].notna()
+        cond     = no_match & hit
+        if not cond.any(): return
+        result.loc[cond, "ga4_views"]    = merged_df.loc[cond, "ga4_views"].values
+        result.loc[cond, "ga4_users"]    = merged_df.loc[cond, "ga4_users"].fillna(0).values
+        result.loc[cond, "match_method"] = method_name
+
+    if not ga4_by_id.empty    and "post_id"     in result.columns:
+        _assign(result[["post_id"]].merge(ga4_by_id, left_on="post_id", right_on="_key_id", how="left"), "post_id")
+    if not ga4_by_title.empty and "_title_norm" in result.columns:
+        _assign(result[["_title_norm"]].merge(ga4_by_title, left_on="_title_norm", right_on="_key_title", how="left"), "titulo_exacto")
+    if not ga4_by_slug.empty  and "_prod_slug"  in result.columns:
+        _assign(result[["_prod_slug"]].merge(ga4_by_slug, left_on="_prod_slug", right_on="_key_slug", how="left"), "slug")
+    if not ga4_by_path.empty  and "_prod_path"  in result.columns:
+        _assign(result[["_prod_path"]].merge(ga4_by_path, left_on="_prod_path", right_on="_key_path", how="left"), "path_completo")
+
+    no_match_mask = result["match_method"] == "sin_match"
+    if no_match_mask.any() and not ga4_by_title.empty and "_title_norm" in result.columns:
+        ga4_titles_list = ga4_by_title["_key_title"].fillna("").tolist()
+        ga4_values_list = list(zip(
+            ga4_by_title["ga4_views"].fillna(0).tolist(),
+            ga4_by_title.get("ga4_users", pd.Series(0, index=ga4_by_title.index)).fillna(0).tolist()
+        ))
+        prod_no_match = result.loc[no_match_mask, "_title_norm"].tolist()
+        fuzzy_results = _fuzzy_match_vectorized(prod_no_match, ga4_titles_list, ga4_values_list)
+        idxs = result.index[no_match_mask]
+        for i, (v, u, method) in enumerate(fuzzy_results):
+            if method != "sin_match":
+                result.at[idxs[i], "ga4_views"]    = v
+                result.at[idxs[i], "ga4_users"]    = u
+                result.at[idxs[i], "match_method"] = method
+
+    result["ga4_views"] = result["ga4_views"].fillna(0).astype(int)
+    result["ga4_users"] = result["ga4_users"].fillna(0).astype(int)
     tags_col = result["tags"] if "tags" in result.columns else pd.Series("", index=result.index)
-    result["is_ia"] = tags_col.apply(lambda x: bool(re.search(r"\bIA\b|\binteligencia[\s_-]?artificial\b", str(x), re.I)))
+    result["is_ia"] = tags_col.apply(lambda x: bool(re.search(r"\\bIA\\b|\\binteligencia[\\s_-]?artificial\\b", str(x), re.I)))
     return result
 
 
