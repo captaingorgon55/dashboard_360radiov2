@@ -63,14 +63,12 @@ def _read_excel(fname: str, sheet: str) -> pd.DataFrame:
     pq = _parquet_path(fname, sheet)
     src_mtime = src.stat().st_mtime
 
-    # usar parquet si existe y es mas nuevo que el Excel
     if pq.exists() and pq.stat().st_mtime >= src_mtime:
         try:
             return pd.read_parquet(pq)
         except Exception:
             pq.unlink(missing_ok=True)
 
-    # leer Excel y guardar parquet
     df = pd.DataFrame()
     for engine in [None, "openpyxl", "xlrd"]:
         try:
@@ -82,13 +80,12 @@ def _read_excel(fname: str, sheet: str) -> pd.DataFrame:
 
     if not df.empty:
         try:
-            # parquet no acepta columnas duplicadas ni tipos mixtos
             df = df.loc[:, ~df.columns.duplicated()]
             for col in df.select_dtypes(include="object").columns:
                 df[col] = df[col].astype(str)
             df.to_parquet(pq, index=False)
         except Exception:
-            pass  # si no se puede guardar parquet, igual retornamos el df
+            pass
 
     return df
 
@@ -182,95 +179,72 @@ def _slug_from_url(url_str) -> str:
 
 
 # =============================================================================
-# LIMPIEZA DE STRINGS  —  FIX v4.3
-# Convierte NaN, None, "nan", "none", "NaN" → cadena vacía.
-# Todas las funciones de autor/tags deben llamar esto primero.
+# LIMPIEZA DE STRINGS
 # =============================================================================
 
 _NAN_STRINGS = {"nan", "none", "null", "na", "n/a", "<na>"}
 
 def _clean_str(val) -> str:
-    """Devuelve string limpio; NaN/None/vacío/'nan' → ''."""
     if val is None:
         return ""
-    if isinstance(val, float) and (val != val):   # np.nan
+    if isinstance(val, float) and (val != val):
         return ""
     s = str(val).strip()
     return "" if s.lower() in _NAN_STRINGS else s
 
 
 # =============================================================================
-# HELPERS  is_360radio / is_ia / resolucion de autor
+# HELPERS AUTOR
 # =============================================================================
 
 _AUTHOR_ALIASES = {
-    # Andrés Martín  (aparece como "Andres M" en tags — 88 posts)
-    "andres m":              "Andrés Martín",
-    "andresm":               "Andrés Martín",
-    "andres martin":         "Andrés Martín",
-    "andrés martin":         "Andrés Martín",
-    "andrés m":              "Andrés Martín",
-    # Julieth Barbosa  (aparece como "Julieth B" en tags)
-    "julieth b":             "Julieth Barbosa",
-    "juliethb":              "Julieth Barbosa",
-    "julieth barbosa":       "Julieth Barbosa",
-    # Juan Camilo Ocampo  (aparece como "Juan Camilo" / "Juan O" en tags)
-    "juan camilo ocampo":    "Juan Camilo Ocampo",
-    "juan camilo":           "Juan Camilo Ocampo",
-    "juan o":                "Juan Camilo Ocampo",
-    "juanocampo":            "Juan Camilo Ocampo",
-    "juan ocampo":           "Juan Camilo Ocampo",
-    # Daniel García  (aparece como "Daniel G" en tags)
-    "daniel g":              "Daniel García",
-    "daniel garcia":         "Daniel García",
-    "daniel garcía":         "Daniel García",
-    # Jorge González  (aparece como "Jorge G" en tags)
-    "jorge g":               "Jorge González",
-    "jorge gonzalez":        "Jorge González",
-    "jorge gonzález":        "Jorge González",
-    # Miguel Vélez  (aparece como "Miguel V" en tags)
-    "miguel v":              "Miguel Vélez",
-    "miguel velez":          "Miguel Vélez",
-    "miguel vélez":          "Miguel Vélez",
-    # Katherine Aranda
-    "katherine aranda":      "Katherine Aranda",
-    "katherine a":           "Katherine Aranda",
-    # Camilo Jaimes
-    "camilo jaimes":         "Camilo Jaimes",
-    "camilo j":              "Camilo Jaimes",
-    # Simón Zapata
-    "simon zapata":          "Simón Zapata",
-    "simón zapata":          "Simón Zapata",
-    # Saúl Hernández
-    "saul hernandez":        "Saúl Hernández",
-    "saúl hernández":        "Saúl Hernández",
+    "andres m": "Andrés Martín",
+    "andresm": "Andrés Martín",
+    "andres martin": "Andrés Martín",
+    "andrés martin": "Andrés Martín",
+    "andrés m": "Andrés Martín",
+    "julieth b": "Julieth Barbosa",
+    "juliethb": "Julieth Barbosa",
+    "julieth barbosa": "Julieth Barbosa",
+    "juan camilo ocampo": "Juan Camilo Ocampo",
+    "juan camilo": "Juan Camilo Ocampo",
+    "juan o": "Juan Camilo Ocampo",
+    "juanocampo": "Juan Camilo Ocampo",
+    "juan ocampo": "Juan Camilo Ocampo",
+    "daniel g": "Daniel García",
+    "daniel garcia": "Daniel García",
+    "daniel garcía": "Daniel García",
+    "jorge g": "Jorge González",
+    "jorge gonzalez": "Jorge González",
+    "jorge gonzález": "Jorge González",
+    "miguel v": "Miguel Vélez",
+    "miguel velez": "Miguel Vélez",
+    "miguel vélez": "Miguel Vélez",
+    "katherine aranda": "Katherine Aranda",
+    "katherine a": "Katherine Aranda",
+    "camilo jaimes": "Camilo Jaimes",
+    "camilo j": "Camilo Jaimes",
+    "simon zapata": "Simón Zapata",
+    "simón zapata": "Simón Zapata",
+    "saul hernandez": "Saúl Hernández",
+    "saúl hernández": "Saúl Hernández",
 }
 
 _IS_360RADIO_AUTHOR = re.compile(r"360\s*radio|radio\s*360|360radio", re.I)
 
 
 def _is_generic_author(author_str) -> bool:
-    """
-    Devuelve True si el autor es el genérico '360 Radio' (o variantes),
-    o si el campo viene vacío/nan (autor no asignado).
-    """
     s = _clean_str(author_str)
     if not s:
-        return True   # campo vacío → tratar como genérico para buscar en tags
+        return True
     return bool(_IS_360RADIO_AUTHOR.search(s))
 
 
 def _resolve_author(author_str, tags_str) -> str:
-    """
-    Si el autor es genérico ('360 Radio' o vacío), busca en los tags
-    algún alias conocido y devuelve el nombre real.
-    Si no encuentra nada, devuelve el autor original (o '360 Radio').
-    """
     author_clean = _clean_str(author_str)
     tags_clean   = _clean_str(tags_str)
 
     if not _is_generic_author(author_clean):
-        # Autor real ya identificado — devolver tal cual
         return author_clean
 
     if not tags_clean:
@@ -278,8 +252,6 @@ def _resolve_author(author_str, tags_str) -> str:
 
     tags_norm = _strip_accents(tags_clean.lower())
     for alias, nombre_real in _AUTHOR_ALIASES.items():
-        # BUG original: faltaba .lower() — alias quedaba con mayúsculas
-        # y tags_norm ya era lowercase → nunca matcheaba
         if _strip_accents(alias.lower()) in tags_norm:
             return nombre_real
 
@@ -287,12 +259,6 @@ def _resolve_author(author_str, tags_str) -> str:
 
 
 def _tags_contain_author(tags_str: str, author_str: str) -> bool:
-    """
-    Devuelve True si algún token significativo del nombre del autor
-    aparece dentro de los tags.
-    Fix v4.3: umbral de longitud bajado a >= 2 (antes > 3) para no
-    descartar apellidos cortos.
-    """
     tags_clean   = _clean_str(tags_str)
     author_clean = _clean_str(author_str)
 
@@ -300,7 +266,6 @@ def _tags_contain_author(tags_str: str, author_str: str) -> bool:
         return False
 
     tags_norm = _strip_accents(tags_clean.lower())
-    # tokens con al menos 2 caracteres (antes filtraba len > 3, perdía "Gil", "Paz", etc.)
     tokens = [
         t.strip()
         for t in re.split(r"[\s,]+", author_clean)
@@ -387,10 +352,48 @@ def load_produccion():
     Carga producción directamente desde Produccion.xlsx, hoja 'Notas + Trafico'.
     No hace matching contra GA4: el Excel ya trae screenPageViews, activeUsers,
     userEngagementDuration y _match_type.
+    Normaliza nombres de columnas para que General funcione sin cambios.
     """
     df = _read_excel("Produccion.xlsx", "Notas + Trafico")
     if df.empty:
         return df
+
+    rename_map = {}
+    for c in df.columns:
+        s = str(c).strip()
+        k = s.lower().replace(" ", "").replace("_", "")
+        if k == "postauthorname":
+            rename_map[c] = "post_author_name"
+        elif k == "posttitle":
+            rename_map[c] = "post_title"
+        elif k == "postdate":
+            rename_map[c] = "post_date"
+        elif k == "postmodified":
+            rename_map[c] = "post_modified"
+        elif k == "poststatus":
+            rename_map[c] = "post_status"
+        elif k == "postid":
+            rename_map[c] = "post_id"
+        elif k == "postauthor":
+            rename_map[c] = "post_author"
+        elif k == "screenpageviews":
+            rename_map[c] = "screenPageViews"
+        elif k == "activeusers":
+            rename_map[c] = "activeUsers"
+        elif k == "userengagementduration":
+            rename_map[c] = "userEngagementDuration"
+        elif k in {"matchtype", "_matchtype"}:
+            rename_map[c] = "_match_type"
+        elif k == "permalink":
+            rename_map[c] = "permalink"
+        elif k == "url":
+            rename_map[c] = "url"
+        elif k == "categories":
+            rename_map[c] = "categories"
+        elif k == "tags":
+            rename_map[c] = "tags"
+    if rename_map:
+        df = df.rename(columns=rename_map)
 
     df = _to_dt(_to_dt(df, "post_date"), "post_modified")
 
@@ -414,7 +417,6 @@ def load_produccion():
             lambda u: urlparse(str(u)).path.rstrip("/").lower() if pd.notna(u) else ""
         )
 
-    # Compatibilidad con vistas existentes
     if "screenPageViews" in df.columns and "ga4_views" not in df.columns:
         df["ga4_views"] = df["screenPageViews"]
     if "activeUsers" in df.columns and "ga4_users" not in df.columns:
@@ -423,6 +425,10 @@ def load_produccion():
         df["match_method"] = df["_match_type"].astype(str)
     elif "match_method" not in df.columns:
         df["match_method"] = "excel_notas_trafico"
+
+    for c in ["post_author_name", "categories", "tags", "post_title", "url"]:
+        if c not in df.columns:
+            df[c] = ""
 
     return df
 
@@ -457,14 +463,6 @@ def load_admanager():
 
 @st.cache_data(ttl=3600)
 def load_viads() -> pd.DataFrame:
-    """
-    Carga el CSV de estadísticas de Viads.
-    Separador ';', fechas DD.MM.YYYY.
-    Busca en orden:
-      1. data/statistics_2025-01-01_2026-04-01.csv
-      2. data/viads.csv  /  data/Viads.csv
-      3. cualquier data/statistics_*.csv
-    """
     candidates = [
         DATA_DIR / "statistics_2025-01-01_2026-04-01.csv",
         DATA_DIR / "viads.csv",
@@ -645,25 +643,15 @@ def load_produccion_con_metricas() -> pd.DataFrame:
 
 # =============================================================================
 # REEXPORTS PÚBLICOS
-# Cualquier vista puede importar match_stats y match_production_to_ga4
-# directamente desde data_loader, sin depender de matching_engine.
-# Si matching_engine falla al cargar, estos fallbacks evitan el ImportError.
 # =============================================================================
 
 def match_stats(prod_df: pd.DataFrame) -> dict:
-    """
-    Devuelve conteo simple de match_method para diagnóstico.
-    No depende de matching_engine.
-    """
     if prod_df is None or prod_df.empty or "match_method" not in prod_df.columns:
         return {}
     return prod_df["match_method"].astype(str).value_counts().to_dict()
 
 
 def match_production_to_ga4(prod: pd.DataFrame, urls: pd.DataFrame) -> pd.DataFrame:
-    """
-    Compatibilidad: devuelve producción sin hacer matching.
-    """
     result = prod.copy()
     if "ga4_views" not in result.columns:
         result["ga4_views"] = 0
