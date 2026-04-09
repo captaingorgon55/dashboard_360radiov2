@@ -1,14 +1,6 @@
 import streamlit as st
 import io
-import subprocess
-import sys
 from datetime import datetime
-
-# Auto-instalar reportlab si no está disponible
-try:
-    import reportlab
-except ImportError:
-    subprocess.check_call([sys.executable, "-m", "pip", "install", "reportlab", "-q"])
 
 st.set_page_config(
     page_title="360Radio · Analytics",
