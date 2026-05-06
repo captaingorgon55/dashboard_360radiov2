@@ -44,7 +44,7 @@ gam     = load_admanager()
 yt      = load_youtube()
 
 # ── MOW plano ────────────────────────────────────────────────────────────────
-mow_rev = 4.2
+mow_rev = 7.44
 
 # ── YouTube: totales = views diarias del canal; tabla = revenue por video ──
 yt_tot_raw = yt.get("totales", pd.DataFrame())   # Fecha + Visualizaciones (diario)
